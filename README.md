@@ -108,6 +108,14 @@ systemctl --user daemon-reload
 systemctl --user enable --now acp-link.service
 ```
 
+**重要：开启 linger，确保服务器重启后无需登录即可自动启动：**
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+> 如果不开启 linger，user service 只会在你 SSH 登录后才启动，服务器重启后进程不会自动拉起。
+
 查看运行状态和日志：
 
 ```bash
