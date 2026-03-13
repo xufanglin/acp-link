@@ -58,7 +58,7 @@ impl LinkService {
         })
     }
 
-    /// 运行主循环：监听飞书消息 + 定期清理 session
+    /// 运行主循环：监听飞书消息 + 定期清理 session + 优雅关机
     pub async fn run(&self) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let client_clone = self.state.client.clone();
@@ -76,6 +76,9 @@ impl LinkService {
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(3600));
         cleanup_interval.tick().await;
 
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
         loop {
             tokio::select! {
                 biased;
@@ -91,6 +94,14 @@ impl LinkService {
                     tokio::spawn(async move {
                         handle_message(state, msg).await;
                     });
+                }
+
+                _ = &mut shutdown => {
+                    tracing::info!("收到关机信号，正在优雅退出...");
+                    if let Err(e) = self.state.session_map.read().await.flush() {
+                        tracing::error!("关机时 session flush 失败: {e}");
+                    }
+                    break;
                 }
             }
         }
@@ -142,6 +153,14 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
                     if is_text {
                         submit_to_acp_streaming(&state, &thread_id, &msg.chat_id, &msg.message_id, &msg)
                             .await;
+                    } else {
+                        if let Err(e) = state
+                            .client
+                            .reply_card(&msg.message_id, "收到附件，请回复文字指令来处理它")
+                            .await
+                        {
+                            tracing::error!("回复附件提示失败: {e}");
+                        }
                     }
                 }
                 None => {
@@ -360,6 +379,29 @@ async fn do_stream(
 
     tracing::debug!("ACP prompt 流结束: session={session_id}");
     Ok(())
+}
+
+/// 等待关机信号（Ctrl+C 或 SIGTERM）
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("注册 Ctrl+C 信号处理器失败");
+    };
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("注册 SIGTERM 信号处理器失败");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 /// 生成消息内容的简短摘要（用于日志）

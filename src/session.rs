@@ -150,8 +150,8 @@ impl SessionMap {
         self.entries.len()
     }
 
-    /// 将映射写入磁盘
-    fn flush(&self) -> Result<()> {
+    /// 将映射原子性地写入磁盘（先写临时文件，再 rename，防止崩溃导致文件损坏）
+    pub(crate) fn flush(&self) -> Result<()> {
         let file = SessionMapFile {
             sessions: self.entries.clone(),
         };
@@ -163,8 +163,22 @@ impl SessionMap {
                 .with_context(|| format!("创建目录失败: {}", parent.display()))?;
         }
 
-        std::fs::write(&self.path, content)
-            .with_context(|| format!("写入 session 映射失败: {}", self.path.display()))?;
+        let tmp_path = self.path.with_file_name(format!(
+            "{}.tmp",
+            self.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+        std::fs::write(&tmp_path, &content)
+            .with_context(|| format!("写入临时 session 文件失败: {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &self.path).with_context(|| {
+            format!(
+                "重命名 session 文件失败: {} -> {}",
+                tmp_path.display(),
+                self.path.display()
+            )
+        })?;
 
         Ok(())
     }

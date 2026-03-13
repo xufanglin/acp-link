@@ -1,8 +1,7 @@
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use agent_client_protocol::{
     Agent, Client, ClientSideConnection, ContentBlock, ImageContent, Implementation,
@@ -11,10 +10,20 @@ use agent_client_protocol::{
     SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
 };
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::KiroConfig;
+
+/// FNV-1a 64 位稳定哈希（跨 Rust 版本和进程重启结果完全一致）
+fn stable_hash(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
 
 /// 从权限选项列表中选择优先级最高的选项 ID
 ///
@@ -101,10 +110,13 @@ enum AcpCommand {
 
 /// ACP 事件循环：在专用线程的 `LocalSet` 内运行，
 /// 负责启动 kiro-cli 子进程、初始化 ACP 连接、处理来自主线程的命令。
+///
+/// 初始化完成后通过 `ready_tx` 发送就绪信号；初始化失败时发送错误。
 async fn acp_event_loop(
     worker_id: usize,
     config: KiroConfig,
     mut cmd_rx: mpsc::Receiver<AcpCommand>,
+    ready_tx: oneshot::Sender<Result<()>>,
 ) -> Result<()> {
     tracing::info!(
         "[worker-{worker_id}] 启动 kiro-cli: {} {:?}",
@@ -141,10 +153,23 @@ async fn acp_event_loop(
 
     let init_req = InitializeRequest::new(ProtocolVersion::LATEST)
         .client_info(Implementation::new("acp-link", env!("CARGO_PKG_VERSION")));
-    let init_resp = conn
+
+    let init_result = conn
         .initialize(init_req)
         .await
-        .map_err(|e| anyhow::anyhow!("ACP 初始化失败: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("ACP 初始化失败: {e:?}"));
+
+    let init_resp = match init_result {
+        Ok(resp) => {
+            let _ = ready_tx.send(Ok(()));
+            resp
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(anyhow::anyhow!("{e}")));
+            return Err(e);
+        }
+    };
+
     let caps = &init_resp.agent_capabilities;
     tracing::info!(
         "[worker-{worker_id}] ACP 已连接: protocol_version={:?}, agent={:?}, prompt_caps=[image={}, audio={}, embedded_context={}]",
@@ -220,12 +245,16 @@ async fn acp_event_loop(
     Ok(())
 }
 
-/// 启动单个 ACP worker 线程，返回命令发送端
+/// 启动单个 ACP worker 线程，返回命令发送端和初始化就绪信号接收端
 ///
 /// 每个 worker 拥有独立的 kiro-cli 子进程、`current_thread` runtime 和 `LocalSet`，
 /// 通过 channel 接收来自主线程的命令并串行执行。
-fn spawn_worker(worker_id: usize, config: &KiroConfig) -> Result<mpsc::Sender<AcpCommand>> {
+fn spawn_worker(
+    worker_id: usize,
+    config: &KiroConfig,
+) -> Result<(mpsc::Sender<AcpCommand>, oneshot::Receiver<Result<()>>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let (ready_tx, ready_rx) = oneshot::channel();
     let config = config.clone();
 
     std::thread::Builder::new()
@@ -238,53 +267,114 @@ fn spawn_worker(worker_id: usize, config: &KiroConfig) -> Result<mpsc::Sender<Ac
             let local = tokio::task::LocalSet::new();
 
             local.block_on(&rt, async {
-                if let Err(e) = acp_event_loop(worker_id, config, cmd_rx).await {
+                if let Err(e) = acp_event_loop(worker_id, config, cmd_rx, ready_tx).await {
                     tracing::error!("[worker-{worker_id}] ACP 工作线程退出: {e}");
                 }
             });
         })
         .with_context(|| format!("启动 ACP 工作线程 {worker_id} 失败"))?;
 
-    Ok(cmd_tx)
+    Ok((cmd_tx, ready_rx))
 }
 
 /// ACP 桥接：通过 worker 进程池与多个 kiro-cli 进程通信
 ///
-/// 使用 routing key 的 hash 将请求路由到固定的 worker，
+/// 使用 routing key 的稳定 hash 将请求路由到固定的 worker，
 /// 保证同一 thread/session 的请求始终由同一个 kiro-cli 处理。
+/// worker 崩溃时自动重启并重试一次。
 pub struct AcpBridge {
-    /// 每个元素对应一个 worker 线程的命令发送端
-    workers: Vec<mpsc::Sender<AcpCommand>>,
+    /// 每个元素对应一个 worker 线程的命令发送端（Mutex 保护以支持重启替换）
+    workers: Vec<Arc<Mutex<mpsc::Sender<AcpCommand>>>>,
+    /// worker 配置，用于崩溃后重启
+    config: KiroConfig,
 }
 
 impl AcpBridge {
     /// 启动 kiro-cli 进程池并建立 ACP 连接
+    ///
+    /// 等待所有 worker 完成初始化（最多 10 秒），确保就绪后才返回。
     pub async fn start(config: &KiroConfig) -> Result<Self> {
         let pool_size = config.pool_size.max(1);
         tracing::info!("启动 ACP 进程池: pool_size={pool_size}");
 
         let mut workers = Vec::with_capacity(pool_size);
+        let mut ready_receivers = Vec::with_capacity(pool_size);
+
         for i in 0..pool_size {
-            let tx = spawn_worker(i, config)?;
-            workers.push(tx);
+            let (tx, ready_rx) = spawn_worker(i, config)?;
+            workers.push(Arc::new(Mutex::new(tx)));
+            ready_receivers.push((i, ready_rx));
         }
 
-        // 等待所有 worker 完成初始化
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        for (i, ready_rx) in ready_receivers {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(10), ready_rx).await {
+                Err(_) => anyhow::bail!("[worker-{i}] 初始化超时"),
+                Ok(Err(_)) => anyhow::bail!("[worker-{i}] 已退出（初始化失败）"),
+                Ok(Ok(Err(e))) => anyhow::bail!("[worker-{i}] 初始化失败: {e}"),
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!("[worker-{i}] 初始化完成");
+                }
+            }
+        }
 
-        Ok(Self { workers })
+        Ok(Self {
+            workers,
+            config: config.clone(),
+        })
     }
 
-    /// 根据 routing key（通常为 thread_id）的 hash 选择 worker
+    /// 根据 routing key 的稳定 hash 选择 worker 索引
     ///
     /// 同一 routing key 始终映射到同一个 worker，保证 session 级别的串行一致性；
     /// 不同 routing key 分散到不同 worker，实现跨会话并行处理。
-    fn route(&self, routing_key: &str) -> &mpsc::Sender<AcpCommand> {
-        let mut hasher = DefaultHasher::new();
-        routing_key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.workers.len();
+    fn route_idx(&self, routing_key: &str) -> usize {
+        let idx = stable_hash(routing_key) as usize % self.workers.len();
         tracing::debug!("路由 key={routing_key} -> worker-{idx}");
-        &self.workers[idx]
+        idx
+    }
+
+    /// 向指定 routing key 对应的 worker 发送命令
+    ///
+    /// 若 worker 已崩溃（send 返回 Err），自动重启 worker 并重试一次。
+    async fn send_cmd(&self, routing_key: &str, cmd: AcpCommand) -> Result<()> {
+        let idx = self.route_idx(routing_key);
+
+        // 快速路径：clone sender，不长时间持锁
+        let sender = self.workers[idx].lock().await.clone();
+        match sender.send(cmd).await {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::mpsc::error::SendError(cmd)) => {
+                // Worker 已崩溃；持锁重启（双重检查：可能另一个任务已完成重启）
+                let mut guard = self.workers[idx].lock().await;
+                match guard.send(cmd).await {
+                    Ok(()) => return Ok(()),
+                    Err(tokio::sync::mpsc::error::SendError(cmd)) => {
+                        tracing::warn!("[worker-{idx}] 进程已崩溃，正在重启...");
+                        let (new_tx, ready_rx) = spawn_worker(idx, &self.config)?;
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(10),
+                            ready_rx,
+                        )
+                        .await
+                        {
+                            Err(_) => anyhow::bail!("[worker-{idx}] 重启超时"),
+                            Ok(Err(_)) => {
+                                anyhow::bail!("[worker-{idx}] 重启后工作线程已退出")
+                            }
+                            Ok(Ok(Err(e))) => {
+                                anyhow::bail!("[worker-{idx}] 重启初始化失败: {e}")
+                            }
+                            Ok(Ok(Ok(()))) => {}
+                        }
+                        *guard = new_tx;
+                        guard
+                            .send(cmd)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("[worker-{idx}] 重启后发送命令失败"))
+                    }
+                }
+            }
+        }
     }
 
     /// 创建新的 ACP session，返回 session_id
@@ -292,10 +382,8 @@ impl AcpBridge {
     /// `routing_key` 用于 hash 路由到固定 worker（调用方传入 thread_id）。
     pub async fn new_session(&self, routing_key: &str, cwd: PathBuf) -> Result<String> {
         let (reply, rx) = oneshot::channel();
-        self.route(routing_key)
-            .send(AcpCommand::NewSession { cwd, reply })
-            .await
-            .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?;
+        self.send_cmd(routing_key, AcpCommand::NewSession { cwd, reply })
+            .await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?
     }
@@ -308,14 +396,15 @@ impl AcpBridge {
         cwd: PathBuf,
     ) -> Result<String> {
         let (reply, rx) = oneshot::channel();
-        self.route(routing_key)
-            .send(AcpCommand::LoadSession {
+        self.send_cmd(
+            routing_key,
+            AcpCommand::LoadSession {
                 session_id: session_id.to_owned(),
                 cwd,
                 reply,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?
     }
@@ -330,14 +419,15 @@ impl AcpBridge {
         content: Vec<ContentBlock>,
     ) -> Result<mpsc::UnboundedReceiver<String>> {
         let (reply, rx) = oneshot::channel();
-        self.route(routing_key)
-            .send(AcpCommand::Prompt {
+        self.send_cmd(
+            routing_key,
+            AcpCommand::Prompt {
                 session_id: session_id.to_owned(),
                 content,
                 reply,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("ACP 工作线程已退出"))?
     }
@@ -379,6 +469,37 @@ mod tests {
     /// 构造一个 PermissionOption，方便测试使用
     fn make_option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption::new(PermissionOptionId::new(id), id, kind)
+    }
+
+    /// 构造一个 AcpBridge，workers 使用假的 sender（接收端立即丢弃）
+    fn make_bridge(pool_size: usize) -> AcpBridge {
+        let config = KiroConfig {
+            cmd: "false".to_string(),
+            args: vec![],
+            pool_size,
+        };
+        let workers = (0..pool_size)
+            .map(|_| {
+                let (tx, _rx) = mpsc::channel::<AcpCommand>(1);
+                Arc::new(Mutex::new(tx))
+            })
+            .collect();
+        AcpBridge { workers, config }
+    }
+
+    // ── stable_hash ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stable_hash_deterministic() {
+        // 相同输入应始终产生相同哈希
+        assert_eq!(stable_hash("hello"), stable_hash("hello"));
+        assert_eq!(stable_hash(""), stable_hash(""));
+    }
+
+    #[test]
+    fn test_stable_hash_different_inputs() {
+        // 不同输入通常产生不同哈希（碰撞极低）
+        assert_ne!(stable_hash("thread_a"), stable_hash("thread_b"));
     }
 
     // ── select_permission_option ─────────────────────────────────────────────
@@ -577,25 +698,14 @@ mod tests {
         }
     }
 
-    // ── AcpBridge::route ─────────────────────────────────────────────────────
-
-    /// 构造一个 AcpBridge，workers 使用假的 sender（接收端立即丢弃）
-    fn make_bridge(pool_size: usize) -> AcpBridge {
-        let workers = (0..pool_size)
-            .map(|_| {
-                let (tx, _rx) = mpsc::channel::<AcpCommand>(1);
-                tx
-            })
-            .collect();
-        AcpBridge { workers }
-    }
+    // ── AcpBridge::route_idx ─────────────────────────────────────────────────
 
     #[test]
     fn test_route_same_key_always_same_worker() {
         // 相同 routing key 必须路由到同一 worker（确定性）
         let bridge = make_bridge(4);
-        let idx_a = std::ptr::addr_of!(*bridge.route("thread_abc")) as usize;
-        let idx_b = std::ptr::addr_of!(*bridge.route("thread_abc")) as usize;
+        let idx_a = bridge.route_idx("thread_abc");
+        let idx_b = bridge.route_idx("thread_abc");
         assert_eq!(idx_a, idx_b, "相同 key 应路由到相同 worker");
     }
 
@@ -604,29 +714,42 @@ mod tests {
         // 不同 key 不要求不同 worker，但路由函数不应 panic
         let bridge = make_bridge(4);
         // 只验证不 panic，以及返回合法 index 范围内的 worker
-        let _ = bridge.route("key_1");
-        let _ = bridge.route("key_2");
-        let _ = bridge.route("");
+        let i1 = bridge.route_idx("key_1");
+        let i2 = bridge.route_idx("key_2");
+        let i3 = bridge.route_idx("");
+        assert!(i1 < 4);
+        assert!(i2 < 4);
+        assert!(i3 < 4);
     }
 
     #[test]
     fn test_route_single_worker_always_same() {
-        // pool_size=1 时，任意 key 都路由到唯一的 worker
+        // pool_size=1 时，任意 key 都路由到唯一的 worker（index 0）
         let bridge = make_bridge(1);
-        let ptr_a = std::ptr::addr_of!(*bridge.route("abc")) as usize;
-        let ptr_b = std::ptr::addr_of!(*bridge.route("xyz")) as usize;
-        assert_eq!(ptr_a, ptr_b, "单 worker 时所有 key 应路由到同一 worker");
+        assert_eq!(bridge.route_idx("abc"), 0);
+        assert_eq!(bridge.route_idx("xyz"), 0);
+        assert_eq!(bridge.route_idx(""), 0);
     }
 
     #[test]
     fn test_route_consistent_across_calls() {
-        // 连续多次调用同一 key，指针地址（worker 引用）保持不变
+        // 连续多次调用同一 key，index 保持不变
         let bridge = make_bridge(8);
         let key = "persistent_thread_id";
-        let first = std::ptr::addr_of!(*bridge.route(key)) as usize;
+        let first = bridge.route_idx(key);
         for _ in 0..10 {
-            let ptr = std::ptr::addr_of!(*bridge.route(key)) as usize;
-            assert_eq!(ptr, first, "路由结果应在多次调用中保持一致");
+            assert_eq!(bridge.route_idx(key), first, "路由结果应在多次调用中保持一致");
+        }
+    }
+
+    #[test]
+    fn test_route_idx_within_bounds() {
+        // 任意 key 的路由结果都在 [0, pool_size) 范围内
+        let bridge = make_bridge(7);
+        let keys = ["", "a", "thread_123", "very_long_key_that_might_overflow"];
+        for key in keys {
+            let idx = bridge.route_idx(key);
+            assert!(idx < 7, "索引 {idx} 超出范围 [0, 7)");
         }
     }
 }
