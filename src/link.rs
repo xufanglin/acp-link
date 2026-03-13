@@ -6,6 +6,8 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
 
+use std::collections::HashSet;
+
 use crate::acp::AcpBridge;
 use crate::config::AppConfig;
 use crate::feishu::{FeishuClient, FeishuMessage, MessageContent};
@@ -13,7 +15,7 @@ use crate::resource::ResourceStore;
 use crate::session::SessionMap;
 
 /// 卡片流式更新的节流间隔
-const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(800);
+const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
@@ -25,6 +27,8 @@ struct SharedState {
     resource_store: ResourceStore,
     /// thread_id ↔ session_id 映射（持久化）
     session_map: RwLock<SessionMap>,
+    /// 已在 ACP worker 中加载的 session_id 集合（跳过重复 load_session）
+    loaded_sessions: RwLock<HashSet<String>>,
     /// 工作目录，传递给 ACP session
     cwd: PathBuf,
 }
@@ -53,6 +57,7 @@ impl LinkService {
                 bridge,
                 resource_store,
                 session_map: RwLock::new(session_map),
+                loaded_sessions: RwLock::new(HashSet::new()),
                 cwd,
             }),
         })
@@ -190,7 +195,7 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
     }
 }
 
-/// 已有 thread 内的文本消息：创建新卡片后流式更新
+/// 已有 thread 内的文本消息：reply_card 和 prepare_prompt 并行，然后流式更新
 async fn submit_to_acp_streaming(
     state: &Arc<SharedState>,
     thread_id: &str,
@@ -198,12 +203,25 @@ async fn submit_to_acp_streaming(
     reply_to_message_id: &str,
     msg: &FeishuMessage,
 ) {
-    match state.client.reply_card(reply_to_message_id, "...").await {
-        Ok((card_msg_id, _)) => {
-            stream_acp_with_card(state, thread_id, chat_id, &card_msg_id, msg).await;
-        }
+    let card_fut = state.client.reply_card(reply_to_message_id, "...");
+    let prompt_fut = prepare_prompt(state, thread_id, chat_id, msg);
+    let (card_result, prompt_result) = tokio::join!(card_fut, prompt_fut);
+
+    let card_msg_id = match card_result {
+        Ok((card_msg_id, _)) => card_msg_id,
         Err(e) => {
             tracing::error!("创建卡片失败: {e}");
+            return;
+        }
+    };
+
+    match prompt_result {
+        Ok((session_id, blocks)) => {
+            stream_acp_with_card_prepared(state, thread_id, &session_id, &card_msg_id, blocks).await;
+        }
+        Err(e) => {
+            tracing::error!("准备 prompt 失败: {e}");
+            let _ = state.client.update_card(&card_msg_id, &format!("处理失败: {e}")).await;
         }
     }
 }
@@ -216,7 +234,30 @@ async fn stream_acp_with_card(
     card_message_id: &str,
     msg: &FeishuMessage,
 ) {
-    match do_stream(state, thread_id, chat_id, card_message_id, msg).await {
+    let prompt_result = prepare_prompt(state, thread_id, chat_id, msg).await;
+    match prompt_result {
+        Ok((session_id, blocks)) => {
+            stream_acp_with_card_prepared(state, thread_id, &session_id, card_message_id, blocks).await;
+        }
+        Err(e) => {
+            tracing::error!("准备 prompt 失败: {e}");
+            let _ = state
+                .client
+                .update_card(card_message_id, &format!("处理失败: {e}"))
+                .await;
+        }
+    }
+}
+
+/// 已准备好 prompt 的流式处理：发送到 ACP → 接收 chunk 并节流更新卡片
+async fn stream_acp_with_card_prepared(
+    state: &Arc<SharedState>,
+    routing_key: &str,
+    session_id: &str,
+    card_message_id: &str,
+    blocks: Vec<ContentBlock>,
+) {
+    match do_stream_prepared(state, routing_key, session_id, card_message_id, blocks).await {
         Ok(()) => {}
         Err(e) => {
             tracing::error!("流式处理失败: {e}");
@@ -247,7 +288,14 @@ async fn prepare_prompt(
         Some(sid) => {
             // 已有 session：增量，只发当前消息文本
             tracing::debug!("增量 prompt: thread={thread_id} -> session={sid}");
-            let session_id = state.bridge.load_session(thread_id, &sid, state.cwd.clone()).await?;
+            let already_loaded = state.loaded_sessions.read().await.contains(&sid);
+            if already_loaded {
+                tracing::debug!("session 已缓存，跳过 load_session: {sid}");
+            } else {
+                state.bridge.load_session(thread_id, &sid, state.cwd.clone()).await?;
+                state.loaded_sessions.write().await.insert(sid.clone());
+            }
+            let session_id = sid;
             let text = match &msg.content {
                 MessageContent::Text(t) => t.clone(),
                 _ => anyhow::bail!("增量模式仅支持文本消息"),
@@ -310,22 +358,21 @@ async fn prepare_prompt(
             let sid = state.bridge.new_session(thread_id, state.cwd.clone()).await?;
             // 写锁插入 session 映射
             state.session_map.write().await.insert(thread_id, &sid)?;
+            state.loaded_sessions.write().await.insert(sid.clone());
             tracing::debug!("新建 session: thread={thread_id} -> session={sid}");
             Ok((sid, blocks))
         }
     }
 }
 
-/// 核心流式处理：准备 prompt → 发送到 ACP → 接收 chunk 并节流更新卡片
-async fn do_stream(
+/// 核心流式处理：发送到 ACP → 接收 chunk 并节流更新卡片（prompt 已准备好）
+async fn do_stream_prepared(
     state: &Arc<SharedState>,
-    thread_id: &str,
-    chat_id: &str,
+    routing_key: &str,
+    session_id: &str,
     card_message_id: &str,
-    msg: &FeishuMessage,
+    blocks: Vec<ContentBlock>,
 ) -> Result<()> {
-    let (session_id, blocks) = prepare_prompt(state, thread_id, chat_id, msg).await?;
-
     for (i, block) in blocks.iter().enumerate() {
         match block {
             ContentBlock::Text(t) => {
@@ -346,7 +393,7 @@ async fn do_stream(
         "发送 ACP prompt: session={session_id}, blocks={}",
         blocks.len()
     );
-    let mut chunk_rx = state.bridge.prompt_stream(thread_id, &session_id, blocks).await?;
+    let mut chunk_rx = state.bridge.prompt_stream(routing_key, session_id, blocks).await?;
     tracing::debug!("ACP prompt 流开始: session={session_id}");
 
     let mut full_text = String::new();
