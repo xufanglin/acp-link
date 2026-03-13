@@ -849,6 +849,131 @@ impl FeishuClient {
         })
     }
 
+    /// 上传图片到飞书，返回 image_key
+    pub async fn upload_image(&self, file_name: &str, image_data: &[u8]) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/im/v1/images");
+        let mime = mime_from_ext(file_name);
+        let part = reqwest::multipart::Part::bytes(image_data.to_vec())
+            .file_name(file_name.to_string())
+            .mime_str(&mime)
+            .context("设置 MIME type 失败")?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+        tracing::debug!(
+            file_name,
+            mime,
+            size = image_data.len(),
+            "上传图片到飞书"
+        );
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await
+            .context("上传图片请求失败")?
+            .json()
+            .await
+            .context("解析上传图片响应失败")?;
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            tracing::warn!(code, msg, "上传图片失败，飞书返回错误");
+            anyhow::bail!("上传图片失败: code={code} msg={msg}");
+        }
+        resp.pointer("/data/image_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("响应中缺少 image_key"))
+    }
+
+    /// 上传文件到飞书，返回 file_key
+    pub async fn upload_file(&self, file_name: &str, file_data: &[u8]) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/im/v1/files");
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .text("file_name", file_name.to_string())
+            .part("file", reqwest::multipart::Part::bytes(file_data.to_vec()).file_name(file_name.to_string()));
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await
+            .context("上传文件请求失败")?
+            .json()
+            .await
+            .context("解析上传文件响应失败")?;
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            anyhow::bail!("上传文件失败: code={code} msg={msg}");
+        }
+        resp.pointer("/data/file_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("响应中缺少 file_key"))
+    }
+
+    /// 以图片消息回复指定消息
+    pub async fn send_image_reply(&self, message_id: &str, image_key: &str) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply");
+        let content = serde_json::json!({"image_key": image_key}).to_string();
+        let body = serde_json::json!({
+            "content": content,
+            "msg_type": "image",
+            "reply_in_thread": true,
+        });
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("发送图片回复请求失败")?
+            .json()
+            .await
+            .context("解析图片回复响应失败")?;
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            anyhow::bail!("发送图片回复失败: code={code} msg={msg}");
+        }
+        Ok(())
+    }
+
+    /// 以文件消息回复指定消息
+    pub async fn send_file_reply(&self, message_id: &str, file_key: &str) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply");
+        let content = serde_json::json!({"file_key": file_key}).to_string();
+        let body = serde_json::json!({
+            "content": content,
+            "msg_type": "file",
+            "reply_in_thread": true,
+        });
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("发送文件回复请求失败")?
+            .json()
+            .await
+            .context("解析文件回复响应失败")?;
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            anyhow::bail!("发送文件回复失败: code={code} msg={msg}");
+        }
+        Ok(())
+    }
+
     /// 获取（带缓存的）tenant_access_token
     pub async fn get_tenant_access_token(&self) -> anyhow::Result<String> {
         {
@@ -1004,6 +1129,25 @@ fn parse_text_content(content: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// 根据文件扩展名推断 MIME type
+fn mime_from_ext(file_name: &str) -> String {
+    let lower = file_name.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
+    } else {
+        "application/octet-stream"
+    }
+    .to_string()
 }
 
 /// 去除飞书群聊中注入的 `@_user_N` 占位符

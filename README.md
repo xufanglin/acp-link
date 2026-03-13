@@ -10,7 +10,8 @@
 - **多媒体消息支持** — 文本、图片、文件、音频、视频、表情包
 - **Thread 话题聚合** — 首条消息聚合整个 thread 上下文，后续消息增量追加
 - **kiro-cli 进程池** — 通过 thread_id hash 路由，支持并行处理（默认 4 个进程）
-- **消息卡片流式更新** — 800ms 节流，流式展示 agent 响应
+- **消息卡片流式更新** — 500ms 节流，流式展示 agent 响应
+- **内嵌 MCP Server** — Streamable HTTP transport，暴露飞书工具（如文件发送）供 agent 调用
 - **资源文件 SHA256 去重存储** — 避免重复下载相同附件
 - **Session 持久化** — JSON 文件存储 thread ↔ session 映射，自动过期清理
 - **配置优先级查找** — 环境变量 > 当前目录 > `~/.acp-link/`
@@ -45,6 +46,9 @@ app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 pool_size = 4          # 进程池大小，按 thread_id hash 路由
+
+[mcp]
+port = 9800            # MCP HTTP Server 监听端口（默认 9800）
 ```
 
 ### 配置查找顺序
@@ -144,7 +148,10 @@ src/
 ├── feishu.rs      # 飞书 WS 客户端：消息监听、thread 聚合、REST API
 ├── acp.rs         # ACP 桥接：kiro-cli 进程池、session 管理、流式响应
 ├── session.rs     # Session 映射：thread_id ↔ session_id，JSON 持久化
-└── resource.rs    # 资源存储：SHA256 去重、文件下载缓存
+├── resource.rs    # 资源存储：SHA256 去重、文件下载缓存
+├── mcp.rs         # MCP Server：Streamable HTTP transport（axum）
+└── mcp/
+    └── feishu_tools.rs  # MCP 工具实现：飞书文件发送等
 ```
 
 ## 技术架构
@@ -166,7 +173,7 @@ AcpBridge（进程池）
   │  通过 ACP SDK（agent-client-protocol）发送 prompt
   ▼
 流式响应收集
-  │  800ms 节流 → 更新飞书消息卡片
+  │  500ms 节流 → 更新飞书消息卡片
   ▼
 飞书消息卡片（最终结果）
 ```
@@ -177,6 +184,80 @@ AcpBridge（进程池）
 - `tokio_util::compat` 桥接 tokio 与 futures 的 `AsyncRead/Write` trait
 - 图片通过魔数（magic bytes）检测 MIME 类型，文件通过扩展名推断
 - Session 过期后自动清理，资源文件同步清理
+- 内嵌 MCP Server（Streamable HTTP）监听 `http://127.0.0.1:{port}/mcp`，供 agent 通过 MCP 协议调用飞书工具
+
+## kiro-cli Agent 配置
+
+要让 kiro-cli 能通过 MCP 协议调用飞书工具（如 `feishu_send_file` 回传文件），需要创建自定义 agent 配置。
+
+### 1. 创建 agent
+
+通过 kiro-cli 命令创建 agent：
+
+```bash
+# 方式一：直接命令行创建
+kiro-cli agent create lark
+
+# 方式二：进入 kiro-cli 交互模式后创建
+kiro-cli
+/agent create
+```
+
+创建后编辑配置文件 `~/.kiro/agents/lark.json`：
+
+```json
+{
+  "name": "lark",
+  "description": "专门用于与飞书交互",
+  "mcpServers": {
+    "feishu": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9800/mcp"
+    }
+  },
+  "tools": ["*"],
+  "allowedTools": [],
+  "resources": [
+    "file://~/.kiro/agents/lark.md"
+  ],
+  "includeMcpJson": false
+}
+```
+
+> `mcpServers.feishu` 指向 acp-link 内嵌的 MCP Server，端口需与 `config.toml` 中的 `[mcp] port` 一致。
+
+### 2. 创建 agent 指令文件
+
+`~/.kiro/agents/lark.md`：
+
+```markdown
+# 文件输出规范
+
+- 所有生成或转换的文件必须输出到 `~/.acp-link/temp/` 目录，禁止使用 `/tmp` 或其他临时目录
+- 使用 `feishu_send_file` 时，`file_path` 也应指向该目录下的文件
+```
+
+### 3. 确认 config.toml 中的 kiro 配置
+
+```toml
+[kiro]
+cmd = "kiro-cli"
+args = ["acp", "--agent", "lark"]
+```
+
+`--agent lark` 会让 kiro-cli 加载上述自定义 agent，从而获得飞书 MCP 工具的调用能力。
+
+如需添加其他 MCP Server（如 `markitdown-mcp` 用于文档转换），可在 `mcpServers` 中追加配置。
+
+## MCP Server
+
+服务启动时会同时在本地启动 MCP HTTP Server（默认端口 `9800`），提供以下工具：
+
+| 工具名 | 说明 |
+|---|---|
+| `feishu_send_file` | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件） |
+
+kiro-cli agent 可通过 MCP 协议调用这些工具，实现向飞书会话发送文件/图片等操作。
 
 ## License
 

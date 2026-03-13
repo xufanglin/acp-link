@@ -15,7 +15,7 @@ use crate::resource::ResourceStore;
 use crate::session::SessionMap;
 
 /// 卡片流式更新的节流间隔
-const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
+const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
@@ -49,7 +49,16 @@ impl LinkService {
         let sessions_path = data_dir.parent().unwrap_or(&data_dir).join("sessions.json");
         let session_map = SessionMap::load(&sessions_path)?;
         let bridge = AcpBridge::start(&config.kiro).await?;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let cwd = AppConfig::temp_dir();
+
+        // 启动内嵌 MCP HTTP Server
+        let mcp_client = client.clone();
+        let mcp_port = config.mcp.port;
+        tokio::spawn(async move {
+            if let Err(e) = crate::mcp::start_mcp_server(mcp_client, mcp_port).await {
+                tracing::error!("MCP Server 异常退出: {e}");
+            }
+        });
 
         Ok(Self {
             state: Arc::new(SharedState {
@@ -113,7 +122,7 @@ impl LinkService {
         Ok(())
     }
 
-    /// 清理过期的 session 映射和资源文件
+    /// 清理过期的 session 映射、资源文件和临时目录
     async fn run_cleanup(&self) {
         if let Err(e) = self.state.session_map.write().await.cleanup_expired() {
             tracing::error!("Session 清理失败: {e}");
@@ -121,7 +130,51 @@ impl LinkService {
         if let Err(e) = self.state.resource_store.cleanup_expired() {
             tracing::error!("资源清理失败: {e}");
         }
+        if let Err(e) = cleanup_temp_dir() {
+            tracing::error!("临时目录清理失败: {e}");
+        }
     }
+}
+
+/// 清理临时目录中超过 3 天的文件（与 session/resource TTL 一致）
+fn cleanup_temp_dir() -> Result<usize> {
+    let temp_dir = AppConfig::temp_dir();
+    let dir = match std::fs::read_dir(&temp_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(
+                anyhow::anyhow!(e).context(format!("读取临时目录失败: {}", temp_dir.display()))
+            )
+        }
+    };
+
+    let now = std::time::SystemTime::now();
+    let ttl = Duration::from_secs(3 * 24 * 3600);
+    let mut removed = 0;
+
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if now.duration_since(modified).unwrap_or_default() > ttl {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("删除过期临时文件失败: {} - {e}", path.display());
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!("临时目录清理完成: 删除 {removed} 个过期文件");
+    }
+    Ok(removed)
 }
 
 /// 处理单条飞书消息：根据是否有 thread 上下文决定新建会话或增量追加
@@ -300,7 +353,11 @@ async fn prepare_prompt(
                 MessageContent::Text(t) => t.clone(),
                 _ => anyhow::bail!("增量模式仅支持文本消息"),
             };
-            Ok((session_id, vec![AcpBridge::text_block(&text)]))
+            let context = format!(
+                "[feishu_context: message_id={}, chat_id={}]\n\n{}",
+                msg.message_id, msg.chat_id, text
+            );
+            Ok((session_id, vec![AcpBridge::text_block(&context)]))
         }
         None => {
             // 新 session：全量聚合 thread 内容
@@ -351,7 +408,13 @@ async fn prepare_prompt(
                 blocks.push(AcpBridge::resource_link_block(&file.file_name, &uri, mime));
             }
 
-            if blocks.is_empty() {
+            // 在最前面注入 feishu_context，供 agent 提取 message_id
+            blocks.insert(0, AcpBridge::text_block(&format!(
+                "[feishu_context: message_id={}, chat_id={}]",
+                msg.message_id, msg.chat_id
+            )));
+
+            if blocks.len() <= 1 {
                 anyhow::bail!("无有效内容可提交");
             }
 

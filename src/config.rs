@@ -42,6 +42,24 @@ fn default_home_dir() -> PathBuf {
         .join(".acp-link")
 }
 
+/// MCP Server 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// HTTP 监听端口，默认 9800
+    #[serde(default = "default_mcp_port")]
+    pub port: u16,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self { port: default_mcp_port() }
+    }
+}
+
+fn default_mcp_port() -> u16 {
+    9800
+}
+
 /// 应用全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -53,12 +71,20 @@ pub struct AppConfig {
     pub log_keep_days: u32,
     pub feishu: FeishuConfig,
     pub kiro: KiroConfig,
+    /// MCP Server 配置（可选，使用默认值）
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 impl AppConfig {
     /// 数据目录：`~/.acp-link/data/`
     pub fn data_dir() -> PathBuf {
         default_home_dir().join("data")
+    }
+
+    /// 临时目录：`~/.acp-link/temp/`（用作 kiro-cli 工作目录）
+    pub fn temp_dir() -> PathBuf {
+        default_home_dir().join("temp")
     }
 
     /// 创建默认配置文件模板
@@ -105,6 +131,9 @@ args = ["acp", "--agent", "lark"]
         let data_dir = Self::data_dir();
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("创建数据目录失败: {}", data_dir.display()))?;
+        let temp_dir = Self::temp_dir();
+        std::fs::create_dir_all(&temp_dir)
+            .with_context(|| format!("创建临时目录失败: {}", temp_dir.display()))?;
         Ok(())
     }
 

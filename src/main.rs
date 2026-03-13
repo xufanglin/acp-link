@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-/// 入口：加载配置 → 初始化日志 → 启动 LinkService
+/// 入口：加载配置 → 初始化日志 → 启动 LinkService（含内嵌 MCP Server）
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = acp_link::config::AppConfig::discover()?;
@@ -22,7 +22,10 @@ async fn main() -> Result<()> {
         .with_writer(non_blocking)
         .init();
 
-    tracing::info!("data_dir: {}", acp_link::config::AppConfig::data_dir().display());
+    tracing::info!(
+        "data_dir: {}",
+        acp_link::config::AppConfig::data_dir().display()
+    );
 
     let service = acp_link::link::LinkService::new(&config).await?;
     service.run().await
@@ -30,8 +33,8 @@ async fn main() -> Result<()> {
 
 /// 清理 log_dir 中超过 keep_days 天的日志文件
 fn cleanup_old_logs(log_dir: &std::path::Path, keep_days: u32) {
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(u64::from(keep_days) * 86400);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(keep_days) * 86400);
 
     let entries = match std::fs::read_dir(log_dir) {
         Ok(e) => e,

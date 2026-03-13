@@ -2,10 +2,12 @@
 
 ## 1. 概述
 
-acp-link 是一个飞书 ↔ ACP（Agent Client Protocol）桥接服务。它监听飞书 WS 长连接接收用户消息，通过 ACP 协议转发给本地运行的 kiro-cli agent，将 agent 的流式响应以消息卡片形式实时回复到飞书。
+acp-link 是一个飞书 ↔ ACP（Agent Client Protocol）桥接服务。它监听飞书 WS 长连接接收用户消息，通过 ACP 协议转发给本地运行的 kiro-cli agent，将 agent 的流式响应以消息卡片形式实时回复到飞书。同时内嵌一个 MCP Server，允许 agent 通过 MCP 协议反向调用飞书能力（如发送文件）。
 
 ```
 飞书用户  ──── WS/REST ────  acp-link  ──── ACP(stdio) ────  kiro-cli
+                                │                                 │
+                                └── MCP HTTP Server ◄─────────────┘
 ```
 
 ---
@@ -14,12 +16,13 @@ acp-link 是一个飞书 ↔ ACP（Agent Client Protocol）桥接服务。它监
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| 飞书客户端 | `feishu.rs` | WS 长连接、protobuf 帧解析、消息去重、token 缓存、REST API（回复/更新卡片、下载资源、拉取 thread） |
-| ACP 桥接 | `acp.rs` | kiro-cli 子进程池、`!Send` runtime 隔离、hash 路由、流式 chunk 转发、权限自动批准 |
-| 核心服务 | `link.rs` | 消息分发、session 生命周期管理、content block 构建、卡片流式更新节流 |
-| 会话映射 | `session.rs` | thread_id ↔ session_id 双向映射、JSON 持久化、3 天过期清理 |
+| 飞书客户端 | `feishu.rs` | WS 长连接、protobuf 帧解析、消息去重、token 缓存、REST API（回复/更新卡片、上传/发送文件、下载资源、拉取 thread） |
+| ACP 桥接 | `acp.rs` | kiro-cli 子进程池、`!Send` runtime 隔离、FNV-1a 稳定 hash 路由、流式 chunk 转发、权限自动批准、worker 崩溃自动重启 |
+| 核心服务 | `link.rs` | 消息分发、session 生命周期管理、content block 构建、卡片流式更新节流、优雅关机 |
+| 会话映射 | `session.rs` | thread_id ↔ session_id 双向映射、message_id → thread_id 反向索引、JSON 原子持久化（tmp+rename）、3 天过期清理 |
 | 资源存储 | `resource.rs` | 飞书文件下载、SHA256 去重落盘、`file://` URI、3 天过期清理 |
 | 配置管理 | `config.rs` | TOML 解析、优先级查找（环境变量 > 当前目录 > `~/.acp-link/`）、自动生成默认配置 |
+| MCP Server | `mcp.rs` + `mcp/feishu_tools.rs` | 内嵌 HTTP Server（Streamable HTTP transport），对外暴露飞书相关 tools（如 `feishu_send_file`），供 agent 反向调用 |
 
 ---
 
@@ -34,6 +37,8 @@ graph TD
     session["session.rs\nSessionMap"]
     resource["resource.rs\nResourceStore"]
     config["config.rs\nAppConfig"]
+    mcp["mcp.rs\nMCP Server"]
+    feishu_tools["mcp/feishu_tools.rs\nFeishu Tools"]
 
     main --> config
     main --> link
@@ -41,7 +46,10 @@ graph TD
     link --> acp
     link --> session
     link --> resource
+    link --> mcp
     resource --> feishu
+    mcp --> feishu_tools
+    feishu_tools --> feishu
 ```
 
 ---
@@ -56,6 +64,7 @@ sequenceDiagram
     participant S as SessionMap
     participant A as AcpBridge
     participant K as kiro-cli
+    participant M as MCP Server
 
     U->>F: 发送消息（文本/图片/文件）
     F->>F: protobuf 解帧 + ACK
@@ -69,7 +78,9 @@ sequenceDiagram
     alt 已有 session（增量模式）
         L->>S: get_session_id(thread_id)
         S-->>L: session_id
-        L->>A: load_session(thread_id, session_id)
+        alt session 未缓存
+            L->>A: load_session(thread_id, session_id)
+        end
     else 新 session（全量模式）
         L->>F: aggregate_thread(thread_id) → 拉取全量消息
         L->>F: download_resource() → 下载图片/文件
@@ -83,9 +94,16 @@ sequenceDiagram
     K-->>A: AgentMessageChunk (流式)
     A-->>L: chunk (UnboundedReceiver<String>)
 
-    loop 每 800ms 或流结束
+    loop 每 500ms 或流结束
         L->>F: update_card(card_msg_id, full_text)
         F->>U: 卡片实时更新
+    end
+
+    opt agent 需要发送文件
+        K->>M: MCP tools/call (feishu_send_file)
+        M->>F: upload_image / upload_file + send_reply
+        F->>U: 图片/文件消息
+        M-->>K: 发送结果
     end
 ```
 
@@ -99,8 +117,10 @@ sequenceDiagram
 
 - **消息接收循环**：单个 `tokio::spawn` 任务持续从 WS 收消息，通过 `mpsc::channel(32)` 送入主循环。
 - **每消息独立任务**：主循环对每条 `FeishuMessage` 调用 `tokio::spawn(handle_message(...))`，多条消息可并发处理。
-- **定时清理**：`tokio::time::interval(3600s)` 定期清理 session 和资源。
-- **共享状态**：`Arc<SharedState>` 跨任务共享；`SessionMap` 用 `RwLock<SessionMap>` 保护写操作。
+- **定时清理**：`tokio::time::interval(3600s)` 定期清理 session、资源文件和临时目录。
+- **优雅关机**：监听 `SIGTERM` / `Ctrl+C`，收到信号后 flush session 映射再退出。
+- **共享状态**：`Arc<SharedState>` 跨任务共享；`SessionMap` 用 `RwLock` 保护，`loaded_sessions` 缓存已加载的 session 避免重复 `load_session` 调用。
+- **MCP Server**：`LinkService::new()` 中以 `tokio::spawn` 启动后台 HTTP 服务（axum）。
 
 ### 5.2 ACP worker 线程（单线程）
 
@@ -133,7 +153,7 @@ graph LR
     Wn -->|"oneshot / UnboundedReceiver<String>"| MT
 ```
 
-命令方向：`AcpCommand` 经 `mpsc::Sender` 发往 worker。
+命令方向：`AcpCommand` 经 `mpsc::Sender` 发往 worker（sender 包裹在 `Arc<Mutex>` 中，支持崩溃后替换）。
 响应方向：`oneshot::Sender` 返回结果；`UnboundedReceiver<String>` 流式返回 chunk。
 
 ---
@@ -142,27 +162,30 @@ graph LR
 
 | 数据 | 文件 | 格式 | 过期策略 |
 |------|------|------|---------|
-| thread_id ↔ session_id | `~/.acp-link/sessions.json` | JSON | 3 天，启动时 + 每小时清理 |
+| thread_id ↔ session_id | `~/.acp-link/sessions.json` | JSON（原子写入：tmp + rename） | 3 天，启动时 + 每小时清理 |
 | 下载的图片/文件 | `~/.acp-link/data/{sha256}.{ext}` | 原始二进制 | 3 天（按文件 mtime） |
+| 临时文件（kiro-cli cwd） | `~/.acp-link/temp/` | 由 kiro-cli 产生 | 3 天（按文件 mtime） |
+| 滚动日志 | `~/.acp-link/logs/acp-link.log.*` | tracing 文本 | 按 `log_keep_days` 配置清理（默认 7 天） |
 
 ---
 
 ## 7. 配置结构
 
 ```toml
-log_level = "info"          # tracing 过滤级别
+log_level = "info"              # tracing 过滤级别
+log_keep_days = 7               # 日志保留天数，默认 7
 
 [feishu]
 app_id     = "cli_xxx"
 app_secret = "your_secret"
 
 [kiro]
-cmd       = "kiro"
+cmd       = "kiro-cli"
 args      = ["acp", "--agent", "lark"]
-pool_size = 4               # worker 线程数，默认 4
+pool_size = 4                   # worker 线程数，默认 4
 
-[storage]
-save_dir = "~/.acp-link/data"
+[mcp]
+port = 9800                     # MCP HTTP Server 端口，默认 9800
 ```
 
 配置查找优先级：
@@ -172,20 +195,47 @@ save_dir = "~/.acp-link/data"
 
 ---
 
-## 8. 依赖清单
+## 8. MCP Server
+
+内嵌的 MCP Server 以 Streamable HTTP transport 运行在 `http://127.0.0.1:{port}/mcp`，实现 JSON-RPC 2.0 协议。
+
+### 8.1 支持的 Tools
+
+| Tool 名称 | 描述 | 参数 |
+|-----------|------|------|
+| `feishu_send_file` | 上传并发送文件到飞书会话 | `file_path`（必填）、`message_id`（必填）、`file_name`（可选） |
+
+图片文件（.png/.jpg/.gif/.webp/.bmp）以 inline image 方式发送，其他文件以附件方式发送。
+
+### 8.2 Session 管理
+
+- `POST /mcp` — JSON-RPC 请求（initialize / tools/list / tools/call）
+- `GET /mcp` — SSE（当前不支持，返回 405）
+- `DELETE /mcp` — 终止 session
+
+`initialize` 时生成 UUID v4 作为 session ID，后续请求需在 `Mcp-Session-Id` header 中携带。
+
+---
+
+## 9. 依赖清单
 
 | crate | 版本 | 用途 |
 |-------|------|------|
 | tokio | 1 (full) | 异步运行时 |
-| tokio-tungstenite | 0.28 | WS 客户端 |
+| tokio-tungstenite | 0.28 (rustls) | WS 客户端 |
 | tokio-util | 0.7 (compat) | futures/tokio AsyncRead 桥接 |
 | prost | 0.14 | protobuf 编解码 |
-| agent-client-protocol | 0.10.0 | ACP SDK |
-| reqwest | 0.13 (json) | 飞书 REST API |
+| agent-client-protocol | 0.10.2 | ACP SDK |
+| reqwest | 0.13 (json, multipart) | 飞书 REST API（含文件上传） |
+| axum | 0.8 | MCP HTTP Server |
+| uuid | 1 (v4) | MCP session ID 生成 |
 | serde / serde_json | 1 | 序列化 |
-| toml | 0.8 | 配置解析 |
+| toml | 0.9 | 配置解析 |
 | sha2 | 0.10 | 文件去重哈希 |
 | anyhow | 1 | 错误处理 |
 | tracing / tracing-subscriber | 0.1 / 0.3 | 结构化日志 |
+| tracing-appender | 0.2 | 滚动日志文件 |
 | base64 | 0.22 | 图片内嵌编码 |
 | async-trait | 0.1 | `?Send` async trait |
+| dirs | 6.0 | 获取用户主目录 |
+| futures / futures-util | 0.3 | ACP SDK 所需 AsyncRead/Write trait |

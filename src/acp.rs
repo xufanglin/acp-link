@@ -126,6 +126,7 @@ async fn acp_event_loop(
 
     let mut child = tokio::process::Command::new(&config.cmd)
         .args(&config.args)
+        .current_dir(crate::config::AppConfig::temp_dir())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())

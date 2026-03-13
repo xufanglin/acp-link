@@ -183,6 +183,10 @@ flowchart TD
 | 更新卡片内容 | PATCH | `/im/v1/messages/{message_id}` |
 | 下载资源文件 | GET | `/im/v1/messages/{message_id}/resources/{file_key}?type={type}` |
 | 拉取 thread 消息列表 | GET | `/im/v1/messages?container_id_type=thread&container_id={thread_id}&page_size=50` |
+| 上传图片 | POST | `/im/v1/images` (multipart/form-data) |
+| 上传文件 | POST | `/im/v1/files` (multipart/form-data) |
+| 发送图片回复 | POST | `/im/v1/messages/{message_id}/reply` (msg_type=image) |
+| 发送文件回复 | POST | `/im/v1/messages/{message_id}/reply` (msg_type=file) |
 
 ### Token 缓存策略
 
@@ -212,3 +216,15 @@ Token 有效期: |-------- 7200s --------|
 ```
 
 回复时设置 `reply_in_thread: true` 以在 Thread 内创建话题，响应中含 `data.thread_id`，作为后续 session 路由的 key。
+
+---
+
+## 11. Thread 聚合
+
+`aggregate_thread` 拉取 thread 内所有消息，按消息类型分类汇总：
+
+- **文本消息**：合并为 `texts` 列表
+- **图片消息**：收集 `(message_id, image_key)` 列表，由调用方按需下载
+- **文件消息**：收集 `(message_id, file_key, file_name)` 列表，由调用方按需下载
+
+此聚合用于新 session 的全量模式，确保 agent 获得完整的对话上下文。

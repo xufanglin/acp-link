@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-`acp.rs` 实现了 acp-link 与 kiro-cli 之间的通信桥接。核心挑战在于：ACP SDK（`agent-client-protocol`）使用了 `!Send` 的 future，无法在 tokio 的多线程调度器上直接使用。为此，桥接层采用**进程池 + 专用线程**架构，将 `!Send` 约束隔离在独立线程内，同时对外暴露线程安全的异步接口。
+`acp.rs` 实现了 acp-link 与 kiro-cli 之间的通信桥接。核心挑战在于：ACP SDK（`agent-client-protocol`）使用了 `!Send` 的 future，无法在 tokio 的多线程调度器上直接使用。为此，桥接层采用**进程池 + 专用线程**架构，将 `!Send` 约束隔离在独立线程内，同时对外暴露线程安全的异步接口。worker 崩溃时支持自动重启。
 
 ---
 
@@ -22,7 +22,7 @@ let rt = tokio::runtime::Builder::new_current_thread()
     .build()?;
 let local = tokio::task::LocalSet::new();
 local.block_on(&rt, async {
-    acp_event_loop(worker_id, config, cmd_rx).await
+    acp_event_loop(worker_id, config, cmd_rx, ready_tx).await
 });
 ```
 
@@ -54,36 +54,43 @@ let (conn, io_task) = ClientSideConnection::new(
 
 - **并行**：多个用户的对话可以并行进入不同 kiro-cli 进程处理。
 - **串行一致性**：同一个飞书 Thread 的消息必须串行进入同一个 kiro-cli 进程，保证 ACP session 上下文连续。
+- **容错**：worker 崩溃时自动重启，对调用方透明。
 
 ### 3.2 Worker 结构
 
 ```
 AcpBridge
-├── workers[0]: mpsc::Sender<AcpCommand>  →  OS Thread(acp-worker-0)
-│                                               current_thread runtime
-│                                               LocalSet
-│                                               kiro-cli process (PID: X)
-│                                               ClientSideConnection (!Send)
-├── workers[1]: mpsc::Sender<AcpCommand>  →  OS Thread(acp-worker-1)
-│                                               ...
-└── workers[N]: mpsc::Sender<AcpCommand>  →  OS Thread(acp-worker-N)
-                                                ...
+├── workers[0]: Arc<Mutex<mpsc::Sender<AcpCommand>>>  →  OS Thread(acp-worker-0)
+│                                                          current_thread runtime
+│                                                          LocalSet
+│                                                          kiro-cli process (PID: X)
+│                                                          ClientSideConnection (!Send)
+├── workers[1]: Arc<Mutex<mpsc::Sender<AcpCommand>>>  →  OS Thread(acp-worker-1)
+│                                                          ...
+└── workers[N]: Arc<Mutex<mpsc::Sender<AcpCommand>>>  →  OS Thread(acp-worker-N)
+                                                           ...
 ```
 
-pool_size 由配置文件的 `kiro.pool_size` 控制，默认为 4。
+pool_size 由配置文件的 `kiro.pool_size` 控制，默认为 4。每个 worker 的 sender 包裹在 `Arc<Mutex>` 中，崩溃重启时可原子替换。
 
-### 3.3 hash 路由
+### 3.3 FNV-1a 稳定 hash 路由
 
 ```rust
-fn route(&self, routing_key: &str) -> &mpsc::Sender<AcpCommand> {
-    let mut hasher = DefaultHasher::new();
-    routing_key.hash(&mut hasher);
-    let idx = (hasher.finish() as usize) % self.workers.len();
-    &self.workers[idx]
+fn stable_hash(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+fn route_idx(&self, routing_key: &str) -> usize {
+    stable_hash(routing_key) as usize % self.workers.len()
 }
 ```
 
-`routing_key` 为飞书 `thread_id`，对同一 thread 的所有请求（new_session / load_session / prompt）始终路由到同一个 worker。不同 thread 的请求则分散到不同 worker，实现并行处理。
+使用 FNV-1a 64 位哈希而非 `DefaultHasher`，确保**跨 Rust 版本和进程重启结果完全一致**。`routing_key` 为飞书 `thread_id`，对同一 thread 的所有请求始终路由到同一个 worker。
 
 ```mermaid
 graph LR
@@ -168,13 +175,14 @@ ACP agent 可能在执行工具调用前请求用户权限。`AcpClientHandler::
 3. 列表第一个选项（兜底）
 
 ```rust
-let option_id = args.options.iter()
-    .find(|o| matches!(o.kind, PermissionOptionKind::AllowAlways))
-    .or_else(|| args.options.iter()
-        .find(|o| matches!(o.kind, PermissionOptionKind::AllowOnce)))
-    .or(args.options.first())
-    .map(|o| o.option_id.clone())
-    .ok_or_else(agent_client_protocol::Error::internal_error)?;
+fn select_permission_option(options: &[PermissionOption]) -> Option<PermissionOptionId> {
+    options.iter()
+        .find(|o| matches!(o.kind, PermissionOptionKind::AllowAlways))
+        .or_else(|| options.iter()
+            .find(|o| matches!(o.kind, PermissionOptionKind::AllowOnce)))
+        .or(options.first())
+        .map(|o| o.option_id.clone())
+}
 ```
 
 ---
@@ -193,14 +201,26 @@ let option_id = args.options.iter()
 
 ---
 
-## 7. 错误处理
+## 7. Worker 崩溃重启
 
-| 场景 | 处理方式 |
-|------|---------|
-| worker 线程退出（kiro-cli 崩溃） | `mpsc::Sender::send` 返回错误，上层 `prompt_stream` 返回 `Err`，`link.rs` 更新卡片为错误信息 |
-| ACP 初始化失败 | `acp_event_loop` 返回 `Err`，tracing::error 记录，worker 线程退出 |
-| Prompt 失败（ACP 层） | 记录 `tracing::error`，chunk_tx drop，主线程 rx 关闭，最终卡片显示已收到的部分内容 |
-| 权限请求无选项 | 返回 `internal_error`，触发 prompt 失败流程 |
+当 worker 进程退出（kiro-cli 崩溃）时，`mpsc::Sender::send` 会返回错误。`send_cmd` 实现了双重检查重启机制：
+
+```mermaid
+flowchart TD
+    A[send_cmd] --> B{快速路径: clone sender + send}
+    B -->|Ok| Z[返回成功]
+    B -->|Err| C[获取 Mutex 独占锁]
+    C --> D{二次尝试 send}
+    D -->|Ok| Z
+    D -->|Err| E[spawn_worker 重启]
+    E --> F{等待 ready 信号\n10s 超时}
+    F -->|Ok| G[替换 sender]
+    G --> H[用新 sender 发送命令]
+    H --> Z
+    F -->|超时/失败| X[返回错误]
+```
+
+双重检查避免多个任务同时检测到崩溃时重复重启同一个 worker。
 
 ---
 
@@ -220,10 +240,24 @@ sequenceDiagram
         T->>T: ClientSideConnection::new(stdin, stdout)
         T->>K: ACP InitializeRequest
         K-->>T: InitializeResponse (capabilities)
+        T-->>B: ready_tx.send(Ok(()))
         T->>T: 进入 cmd_rx 等待循环
     end
-    B->>B: sleep(100ms) 等待所有 worker 完成初始化
+    B->>B: 等待所有 worker ready_rx（10 秒超时）
     B-->>M: Ok(AcpBridge)
 ```
 
-`sleep(100ms)` 是一个宽松的等待，确保各 worker 在接受命令前完成 ACP 握手。若 kiro-cli 启动较慢，首条命令可能在握手完成前到达，`cmd_rx` 的 channel buffer（容量 32）会缓冲该命令直到 worker 就绪。
+每个 worker 初始化完成后通过 `oneshot::Sender<Result<()>>` 发送就绪信号。`AcpBridge::start` 等待所有 worker 就绪（10 秒超时），确保在接受命令前所有 kiro-cli 进程已完成 ACP 握手。
+
+---
+
+## 9. 错误处理
+
+| 场景 | 处理方式 |
+|------|---------|
+| worker 线程退出（kiro-cli 崩溃） | `send_cmd` 检测到 send 失败，自动重启 worker 并重试一次 |
+| ACP 初始化失败 | `ready_tx` 发送错误，`AcpBridge::start` 返回 `Err`，服务启动失败 |
+| ACP 初始化超时 | `tokio::time::timeout(10s)` 触发，`AcpBridge::start` 返回 `Err` |
+| Prompt 失败（ACP 层） | 记录 `tracing::error`，chunk_tx drop，主线程 rx 关闭，最终卡片显示已收到的部分内容 |
+| 权限请求无选项 | 返回 `internal_error`，触发 prompt 失败流程 |
+| Worker 重启后仍失败 | 返回 `Err` 给调用方，`link.rs` 更新卡片为错误信息 |

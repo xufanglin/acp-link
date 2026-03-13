@@ -1,4 +1,6 @@
 log_level = "debug"
+# 日志保留天数，默认 7 天
+# log_keep_days = 7
 
 [feishu]
 app_id = "cli_xxxxxxx"
@@ -9,3 +11,7 @@ cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 # 进程池大小，通过 thread_id hash 路由实现并行处理，默认 4
 # pool_size = 4
+
+[mcp]
+# HTTP 监听端口，默认 9800
+# port = 9800

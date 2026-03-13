@@ -7,5 +7,6 @@ pub mod acp;
 pub mod config;
 pub mod feishu;
 pub mod link;
+pub mod mcp;
 pub mod resource;
 pub mod session;
