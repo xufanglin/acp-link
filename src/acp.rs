@@ -318,10 +318,84 @@ impl AcpBridge {
             }
         }
 
-        Ok(Self {
+        let bridge = Self {
             workers,
             config: config.clone(),
-        })
+        };
+        bridge.spawn_keepalive()?;
+        Ok(bridge)
+    }
+
+    /// 启动专用 keepalive worker 和后台保活任务
+    ///
+    /// 使用独立的 kiro-cli 进程，每 6 小时发送一次轻量 prompt，
+    /// 确保认证 token 不会过期，且不阻塞业务 worker。
+    fn spawn_keepalive(&self) -> Result<()> {
+        let (tx, ready_rx) = spawn_worker(usize::MAX, &self.config)?;
+
+        let temp_dir = crate::config::AppConfig::temp_dir();
+        tokio::spawn(async move {
+            // 等待 keepalive worker 就绪
+            match ready_rx.await {
+                Ok(Ok(())) => tracing::info!("[keepalive] worker 初始化完成"),
+                other => {
+                    tracing::error!("[keepalive] worker 初始化失败: {other:?}");
+                    return;
+                }
+            }
+
+            let interval = tokio::time::Duration::from_secs(6 * 3600);
+            loop {
+                tokio::time::sleep(interval).await;
+                tracing::info!("[keepalive] 开始保活心跳");
+
+                // 1) 创建临时 session
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if tx
+                    .send(AcpCommand::NewSession {
+                        cwd: temp_dir.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("[keepalive] worker 已断开");
+                    return;
+                }
+
+                let session_id = match reply_rx.await {
+                    Ok(Ok(sid)) => sid,
+                    other => {
+                        tracing::warn!("[keepalive] 创建 session 失败: {other:?}");
+                        continue;
+                    }
+                };
+
+                // 2) 发送轻量 prompt
+                let (prompt_tx, prompt_rx) = oneshot::channel();
+                if tx
+                    .send(AcpCommand::Prompt {
+                        session_id,
+                        content: vec![ContentBlock::Text(TextContent::new("hello"))],
+                        reply: prompt_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("[keepalive] worker 已断开");
+                    return;
+                }
+
+                // 消费 chunk receiver 直到结束
+                if let Ok(Ok(mut rx)) = prompt_rx.await {
+                    while rx.recv().await.is_some() {}
+                }
+
+                tracing::info!("[keepalive] 心跳完成");
+            }
+        });
+
+        Ok(())
     }
 
     /// 根据 routing key 的稳定 hash 选择 worker 索引
