@@ -17,10 +17,10 @@ acp-link 是一个飞书 ↔ ACP（Agent Client Protocol）桥接服务。它监
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | 飞书客户端 | `feishu.rs` | WS 长连接、protobuf 帧解析、消息去重、token 缓存、REST API（回复/更新卡片、上传/发送文件、下载资源、拉取 thread） |
-| ACP 桥接 | `acp.rs` | kiro-cli 子进程池、`!Send` runtime 隔离、FNV-1a 稳定 hash 路由、流式 chunk 转发、权限自动批准、worker 崩溃自动重启 |
-| 核心服务 | `link.rs` | 消息分发、session 生命周期管理、content block 构建、卡片流式更新节流、优雅关机 |
-| 会话映射 | `session.rs` | thread_id ↔ session_id 双向映射、message_id → thread_id 反向索引、JSON 原子持久化（tmp+rename）、3 天过期清理 |
-| 资源存储 | `resource.rs` | 飞书文件下载、SHA256 去重落盘、`file://` URI、3 天过期清理 |
+| ACP 桥接 | `acp.rs` | kiro-cli 子进程池、`!Send` runtime 隔离、FNV-1a 稳定 hash 路由、流式 chunk 转发、权限自动批准、worker 崩溃自动重启、keepalive 心跳（每 6 小时） |
+| 核心服务 | `link.rs` | 消息分发、session 生命周期管理、content block 构建、卡片流式更新节流（300ms）、优雅关机 |
+| 会话映射 | `session.rs` | thread_id ↔ session_id 双向映射、message_id → thread_id 反向索引、JSON 原子持久化（tmp+rename）、按配置天数过期清理（默认 7 天） |
+| 资源存储 | `resource.rs` | 飞书文件下载、SHA256 去重落盘、`file://` URI、按配置天数过期清理（默认 7 天） |
 | 配置管理 | `config.rs` | TOML 解析、优先级查找（环境变量 > 当前目录 > `~/.acp-link/`）、自动生成默认配置 |
 | MCP Server | `mcp.rs` + `mcp/feishu_tools.rs` | 内嵌 HTTP Server（Streamable HTTP transport），对外暴露飞书相关 tools（如 `feishu_send_file`），供 agent 反向调用 |
 
@@ -94,7 +94,7 @@ sequenceDiagram
     K-->>A: AgentMessageChunk (流式)
     A-->>L: chunk (UnboundedReceiver<String>)
 
-    loop 每 500ms 或流结束
+    loop 每 300ms 或流结束
         L->>F: update_card(card_msg_id, full_text)
         F->>U: 卡片实时更新
     end
@@ -121,6 +121,7 @@ sequenceDiagram
 - **优雅关机**：监听 `SIGTERM` / `Ctrl+C`，收到信号后 flush session 映射再退出。
 - **共享状态**：`Arc<SharedState>` 跨任务共享；`SessionMap` 用 `RwLock` 保护，`loaded_sessions` 缓存已加载的 session 避免重复 `load_session` 调用。
 - **MCP Server**：`LinkService::new()` 中以 `tokio::spawn` 启动后台 HTTP 服务（axum）。
+- **Keepalive**：`AcpBridge::start()` 启动独立的 keepalive worker（worker ID = `usize::MAX`），每 6 小时创建临时 session 并发送轻量 prompt，防止认证 token 过期。worker 崩溃时自动重启（最多 3 次带退避重试）。
 
 ### 5.2 ACP worker 线程（单线程）
 
@@ -162,10 +163,10 @@ graph LR
 
 | 数据 | 文件 | 格式 | 过期策略 |
 |------|------|------|---------|
-| thread_id ↔ session_id | `~/.acp-link/sessions.json` | JSON（原子写入：tmp + rename） | 3 天，启动时 + 每小时清理 |
-| 下载的图片/文件 | `~/.acp-link/data/{sha256}.{ext}` | 原始二进制 | 3 天（按文件 mtime） |
-| 临时文件（kiro-cli cwd） | `~/.acp-link/temp/` | 由 kiro-cli 产生 | 3 天（按文件 mtime） |
-| 滚动日志 | `~/.acp-link/logs/acp-link.log.*` | tracing 文本 | 按 `log_keep_days` 配置清理（默认 7 天） |
+| thread_id ↔ session_id | `~/.acp-link/sessions.json` | JSON（原子写入：tmp + rename） | `session_retention` 天（默认 7），启动时 + 每小时清理 |
+| 下载的图片/文件 | `~/.acp-link/data/{sha256}.{ext}` | 原始二进制 | `resource_retention` 天（默认 7，按文件 mtime） |
+| 临时文件（kiro-cli cwd） | `~/.acp-link/temp/` | 由 kiro-cli 产生 | `resource_retention` 天（默认 7，按文件 mtime） |
+| 滚动日志 | `~/.acp-link/logs/acp-link.log.*` | tracing 文本 | 按 `log_retention` 配置清理（默认 7 天） |
 
 ---
 
@@ -173,7 +174,9 @@ graph LR
 
 ```toml
 log_level = "info"              # tracing 过滤级别
-log_keep_days = 7               # 日志保留天数，默认 7
+log_retention = 7               # 日志保留天数，默认 7
+session_retention = 7           # Session 保留天数，默认 7
+resource_retention = 7          # 资源文件保留天数，默认 7
 
 [feishu]
 app_id     = "cli_xxx"

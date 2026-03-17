@@ -8,14 +8,14 @@ use tokio::time::{Duration, Instant};
 
 use std::collections::HashSet;
 
-use crate::acp::AcpBridge;
+use crate::acp::{AcpBridge, StreamEvent};
 use crate::config::AppConfig;
 use crate::feishu::{FeishuClient, FeishuMessage, MessageContent};
 use crate::resource::ResourceStore;
 use crate::session::SessionMap;
 
 /// 卡片流式更新的节流间隔
-const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
@@ -31,6 +31,14 @@ struct SharedState {
     loaded_sessions: RwLock<HashSet<String>>,
     /// 工作目录，传递给 ACP session
     cwd: PathBuf,
+    /// Session 保留天数
+    session_retention: u32,
+    /// 资源文件保留天数
+    resource_retention: u32,
+    /// 日志保留天数
+    log_retention: u32,
+    /// 日志目录
+    log_dir: PathBuf,
 }
 
 /// Link 服务：飞书消息监听 → ACP 转发 → 回复
@@ -68,6 +76,10 @@ impl LinkService {
                 session_map: RwLock::new(session_map),
                 loaded_sessions: RwLock::new(HashSet::new()),
                 cwd,
+                session_retention: config.session_retention,
+                resource_retention: config.resource_retention,
+                log_retention: config.log_retention,
+                log_dir: AppConfig::log_dir(),
             }),
         })
     }
@@ -124,20 +136,61 @@ impl LinkService {
 
     /// 清理过期的 session 映射、资源文件和临时目录
     async fn run_cleanup(&self) {
-        if let Err(e) = self.state.session_map.write().await.cleanup_expired() {
+        if let Err(e) = self
+            .state
+            .session_map
+            .write()
+            .await
+            .cleanup_expired(self.state.session_retention)
+        {
             tracing::error!("Session 清理失败: {e}");
         }
-        if let Err(e) = self.state.resource_store.cleanup_expired() {
+        if let Err(e) = self
+            .state
+            .resource_store
+            .cleanup_expired(self.state.resource_retention)
+        {
             tracing::error!("资源清理失败: {e}");
         }
-        if let Err(e) = cleanup_temp_dir() {
+        if let Err(e) = cleanup_temp_dir(self.state.resource_retention) {
             tracing::error!("临时目录清理失败: {e}");
+        }
+        cleanup_old_logs(&self.state.log_dir, self.state.log_retention);
+    }
+}
+
+/// 清理 log_dir 中超过 retention 天的日志文件
+fn cleanup_old_logs(log_dir: &std::path::Path, retention: u32) {
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(retention) * 86400);
+
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // 只清理形如 acp-link.log.YYYY-MM-DD 的滚动日志文件
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("acp-link.log.") {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if let Ok(modified) = metadata.modified() {
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
     }
 }
 
-/// 清理临时目录中超过 3 天的文件（与 session/resource TTL 一致）
-fn cleanup_temp_dir() -> Result<usize> {
+/// 清理临时目录中过期的文件
+fn cleanup_temp_dir(retention: u32) -> Result<usize> {
     let temp_dir = AppConfig::temp_dir();
     let dir = match std::fs::read_dir(&temp_dir) {
         Ok(d) => d,
@@ -145,12 +198,12 @@ fn cleanup_temp_dir() -> Result<usize> {
         Err(e) => {
             return Err(
                 anyhow::anyhow!(e).context(format!("读取临时目录失败: {}", temp_dir.display()))
-            )
+            );
         }
     };
 
     let now = std::time::SystemTime::now();
-    let ttl = Duration::from_secs(3 * 24 * 3600);
+    let ttl = Duration::from_secs(u64::from(retention) * 24 * 3600);
     let mut removed = 0;
 
     for entry in dir.flatten() {
@@ -190,10 +243,19 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
 
     match &msg.root_id {
         None => {
-            let hint = if is_text { "..." } else { "收到，请继续输入指令" };
+            let hint = if is_text {
+                "..."
+            } else {
+                "收到，请继续输入指令"
+            };
             match state.client.reply_card(&msg.message_id, hint).await {
                 Ok((card_msg_id, thread_id)) => {
-                    if let Err(e) = state.session_map.write().await.map_thread(&msg.message_id, &thread_id) {
+                    if let Err(e) = state
+                        .session_map
+                        .write()
+                        .await
+                        .map_thread(&msg.message_id, &thread_id)
+                    {
                         tracing::error!("持久化 thread 映射失败: {e}");
                     }
                     if is_text {
@@ -205,12 +267,23 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
             }
         }
         Some(root_id) => {
-            let thread_id = state.session_map.read().await.get_thread_id(root_id).map(str::to_owned);
+            let thread_id = state
+                .session_map
+                .read()
+                .await
+                .get_thread_id(root_id)
+                .map(str::to_owned);
             match thread_id {
                 Some(thread_id) => {
                     if is_text {
-                        submit_to_acp_streaming(&state, &thread_id, &msg.chat_id, &msg.message_id, &msg)
-                            .await;
+                        submit_to_acp_streaming(
+                            &state,
+                            &thread_id,
+                            &msg.chat_id,
+                            &msg.message_id,
+                            &msg,
+                        )
+                        .await;
                     } else {
                         if let Err(e) = state
                             .client
@@ -223,10 +296,19 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
                 }
                 None => {
                     tracing::debug!("[{}] root_id={root_id} 无映射，作为新会话处理", msg.chat_id);
-                    let hint = if is_text { "..." } else { "收到，请继续输入指令" };
+                    let hint = if is_text {
+                        "..."
+                    } else {
+                        "收到，请继续输入指令"
+                    };
                     match state.client.reply_card(&msg.message_id, hint).await {
                         Ok((card_msg_id, thread_id)) => {
-                            if let Err(e) = state.session_map.write().await.map_thread(root_id, &thread_id) {
+                            if let Err(e) = state
+                                .session_map
+                                .write()
+                                .await
+                                .map_thread(root_id, &thread_id)
+                            {
                                 tracing::error!("持久化 thread 映射失败: {e}");
                             }
                             if is_text {
@@ -270,11 +352,15 @@ async fn submit_to_acp_streaming(
 
     match prompt_result {
         Ok((session_id, blocks)) => {
-            stream_acp_with_card_prepared(state, thread_id, &session_id, &card_msg_id, blocks).await;
+            stream_acp_with_card_prepared(state, thread_id, &session_id, &card_msg_id, blocks)
+                .await;
         }
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
-            let _ = state.client.update_card(&card_msg_id, &format!("处理失败: {e}")).await;
+            let _ = state
+                .client
+                .update_card(&card_msg_id, &format!("处理失败: {e}"))
+                .await;
         }
     }
 }
@@ -290,7 +376,8 @@ async fn stream_acp_with_card(
     let prompt_result = prepare_prompt(state, thread_id, chat_id, msg).await;
     match prompt_result {
         Ok((session_id, blocks)) => {
-            stream_acp_with_card_prepared(state, thread_id, &session_id, card_message_id, blocks).await;
+            stream_acp_with_card_prepared(state, thread_id, &session_id, card_message_id, blocks)
+                .await;
         }
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
@@ -345,7 +432,10 @@ async fn prepare_prompt(
             if already_loaded {
                 tracing::debug!("session 已缓存，跳过 load_session: {sid}");
             } else {
-                state.bridge.load_session(thread_id, &sid, state.cwd.clone()).await?;
+                state
+                    .bridge
+                    .load_session(thread_id, &sid, state.cwd.clone())
+                    .await?;
                 state.loaded_sessions.write().await.insert(sid.clone());
             }
             let session_id = sid;
@@ -409,16 +499,22 @@ async fn prepare_prompt(
             }
 
             // 在最前面注入 feishu_context，供 agent 提取 message_id
-            blocks.insert(0, AcpBridge::text_block(&format!(
-                "[feishu_context: message_id={}, chat_id={}]",
-                msg.message_id, msg.chat_id
-            )));
+            blocks.insert(
+                0,
+                AcpBridge::text_block(&format!(
+                    "[feishu_context: message_id={}, chat_id={}]",
+                    msg.message_id, msg.chat_id
+                )),
+            );
 
             if blocks.len() <= 1 {
                 anyhow::bail!("无有效内容可提交");
             }
 
-            let sid = state.bridge.new_session(thread_id, state.cwd.clone()).await?;
+            let sid = state
+                .bridge
+                .new_session(thread_id, state.cwd.clone())
+                .await?;
             // 写锁插入 session 映射
             state.session_map.write().await.insert(thread_id, &sid)?;
             state.loaded_sessions.write().await.insert(sid.clone());
@@ -456,38 +552,92 @@ async fn do_stream_prepared(
         "发送 ACP prompt: session={session_id}, blocks={}",
         blocks.len()
     );
-    let mut chunk_rx = state.bridge.prompt_stream(routing_key, session_id, blocks).await?;
+    let mut chunk_rx = state
+        .bridge
+        .prompt_stream(routing_key, session_id, blocks)
+        .await?;
+    let stream_start = Instant::now();
     tracing::debug!("ACP prompt 流开始: session={session_id}");
 
     let mut full_text = String::new();
-    let mut last_update = Instant::now();
+    // 初始时间设为"很久以前"，确保首个 chunk 立即触发卡片更新
+    let mut last_update = Instant::now() - CARD_UPDATE_INTERVAL;
     let mut dirty = false;
-
-    while let Some(chunk) = chunk_rx.recv().await {
-        full_text.push_str(&chunk);
-        dirty = true;
+    let mut chunk_count: u64 = 0;
+    let mut first_chunk_logged = false;
+    // 跟踪后台卡片更新任务，避免并发更新冲突
+    let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
+    while let Some(event) = chunk_rx.recv().await {
+        chunk_count += 1;
+        let in_tool_call = matches!(&event, StreamEvent::ToolCall(_));
+        match event {
+            StreamEvent::Text(chunk) => {
+                if !first_chunk_logged {
+                    tracing::info!(
+                        "首个 chunk 到达: session={session_id}, 延迟={}ms",
+                        stream_start.elapsed().as_millis()
+                    );
+                    first_chunk_logged = true;
+                }
+                full_text.push_str(&chunk);
+                dirty = true;
+            }
+            StreamEvent::ToolCall(title) => {
+                tracing::debug!("工具调用中: {title}, session={session_id}");
+                dirty = true;
+            }
+        }
 
         if last_update.elapsed() >= CARD_UPDATE_INTERVAL {
-            if let Err(e) = state.client.update_card(card_message_id, &full_text).await {
-                tracing::warn!("更新卡片失败（将继续）: {e}");
+            // 如果上一次更新还在进行中，跳过本次（下次会带上所有累积 chunk）
+            let should_send = match &inflight {
+                Some(h) => h.is_finished(),
+                None => true,
+            };
+            if should_send {
+                let client = state.client.clone();
+                let msg_id = card_message_id.to_string();
+                let trimmed = full_text.trim_start_matches('\n');
+                let text_snapshot = if in_tool_call {
+                    format!("{trimmed}\n...")
+                } else {
+                    trimmed.to_string()
+                };
+                inflight = Some(tokio::spawn(async move {
+                    let t = Instant::now();
+                    if let Err(e) = client.update_card(&msg_id, &text_snapshot).await {
+                        tracing::warn!("更新卡片失败（将继续）: {e}");
+                    }
+                    tracing::debug!("卡片更新耗时: {}ms", t.elapsed().as_millis());
+                }));
+                last_update = Instant::now();
+                dirty = false;
             }
-            last_update = Instant::now();
-            dirty = false;
+        }
+    }
+
+    // 等待最后一次后台更新完成
+    if let Some(h) = inflight {
+        if let Err(e) = h.await {
+            tracing::error!("后台卡片更新任务异常: {e}");
         }
     }
 
     if dirty || full_text.is_empty() {
-        let final_text = if full_text.is_empty() {
+        let final_text = if full_text.trim().is_empty() {
             "(无响应)".to_string()
         } else {
-            full_text
+            full_text.trim_start_matches('\n').to_string()
         };
         if let Err(e) = state.client.update_card(card_message_id, &final_text).await {
             tracing::error!("最终更新卡片失败: {e}");
         }
     }
 
-    tracing::debug!("ACP prompt 流结束: session={session_id}");
+    tracing::info!(
+        "ACP prompt 流结束: session={session_id}, chunks={chunk_count}, 总耗时={}ms",
+        stream_start.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -501,9 +651,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("注册 SIGTERM 信号处理器失败");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("注册 SIGTERM 信号处理器失败");
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
@@ -668,7 +817,10 @@ mod tests {
     #[test]
     fn test_mime_from_filename_doc() {
         // .doc 与 .docx 应映射相同 MIME
-        assert_eq!(mime_from_filename("old.doc"), mime_from_filename("new.docx"));
+        assert_eq!(
+            mime_from_filename("old.doc"),
+            mime_from_filename("new.docx")
+        );
     }
 
     #[test]
@@ -736,7 +888,10 @@ mod tests {
     #[test]
     fn test_mime_from_filename_multiple_dots() {
         // 多点文件名取最后一个扩展名
-        assert_eq!(mime_from_filename("my.report.v2.pdf"), Some("application/pdf"));
+        assert_eq!(
+            mime_from_filename("my.report.v2.pdf"),
+            Some("application/pdf")
+        );
     }
 
     // ── format_summary ───────────────────────────────────────────────────────
@@ -751,7 +906,9 @@ mod tests {
 
     #[test]
     fn test_format_summary_image() {
-        let content = MessageContent::Image { image_key: "img_key_001".to_string() };
+        let content = MessageContent::Image {
+            image_key: "img_key_001".to_string(),
+        };
         let summary = format_summary(&content);
         assert!(summary.contains("图片"));
         assert!(summary.contains("img_key_001"));
@@ -772,7 +929,10 @@ mod tests {
 
     #[test]
     fn test_format_summary_audio() {
-        let content = MessageContent::Audio { file_key: "ak_001".to_string(), duration_ms: 5000 };
+        let content = MessageContent::Audio {
+            file_key: "ak_001".to_string(),
+            duration_ms: 5000,
+        };
         let summary = format_summary(&content);
         assert!(summary.contains("音频"));
         assert!(summary.contains("5000"));
@@ -825,7 +985,9 @@ mod tests {
 
     #[test]
     fn test_is_text_message_false_for_image() {
-        let msg = make_msg(MessageContent::Image { image_key: "k".to_string() });
+        let msg = make_msg(MessageContent::Image {
+            image_key: "k".to_string(),
+        });
         assert!(!is_text_message(&msg));
     }
 
@@ -841,7 +1003,10 @@ mod tests {
 
     #[test]
     fn test_is_text_message_false_for_audio() {
-        let msg = make_msg(MessageContent::Audio { file_key: "k".to_string(), duration_ms: 0 });
+        let msg = make_msg(MessageContent::Audio {
+            file_key: "k".to_string(),
+            duration_ms: 0,
+        });
         assert!(!is_text_message(&msg));
     }
 

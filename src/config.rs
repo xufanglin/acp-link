@@ -31,7 +31,15 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_log_keep_days() -> u32 {
+fn default_log_retention() -> u32 {
+    7
+}
+
+fn default_session_retention() -> u32 {
+    7
+}
+
+fn default_resource_retention() -> u32 {
     7
 }
 
@@ -52,7 +60,9 @@ pub struct McpConfig {
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { port: default_mcp_port() }
+        Self {
+            port: default_mcp_port(),
+        }
     }
 }
 
@@ -67,8 +77,14 @@ pub struct AppConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// 日志保留天数，默认 7 天
-    #[serde(default = "default_log_keep_days")]
-    pub log_keep_days: u32,
+    #[serde(default = "default_log_retention")]
+    pub log_retention: u32,
+    /// Session 保留天数，默认 3 天
+    #[serde(default = "default_session_retention")]
+    pub session_retention: u32,
+    /// 资源文件保留天数，默认 3 天
+    #[serde(default = "default_resource_retention")]
+    pub resource_retention: u32,
     pub feishu: FeishuConfig,
     pub kiro: KiroConfig,
     /// MCP Server 配置（可选，使用默认值）
@@ -80,6 +96,11 @@ impl AppConfig {
     /// 数据目录：`~/.acp-link/data/`
     pub fn data_dir() -> PathBuf {
         default_home_dir().join("data")
+    }
+
+    /// 日志目录：`~/.acp-link/logs/`
+    pub fn log_dir() -> PathBuf {
+        default_home_dir().join("logs")
     }
 
     /// 临时目录：`~/.acp-link/temp/`（用作 kiro-cli 工作目录）

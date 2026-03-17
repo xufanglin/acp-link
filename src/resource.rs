@@ -6,8 +6,6 @@ use sha2::{Digest, Sha256};
 
 use crate::feishu::FeishuClient;
 
-/// 资源文件过期时间：3 天
-const RESOURCE_TTL: Duration = Duration::from_secs(3 * 24 * 3600);
 
 /// 资源存储：将飞书下载的图片/文件以 SHA256 去重保存到本地目录
 #[derive(Clone)]
@@ -65,14 +63,24 @@ impl ResourceStore {
                 .with_context(|| format!("写入资源文件失败: {}", path.display()))?;
             tracing::info!("资源已保存: {filename} ({} bytes)", data.len());
         } else {
+            // 刷新 mtime，防止去重文件被清理误删
+            let times = std::fs::FileTimes::new().set_modified(SystemTime::now());
+            if let Err(e) = std::fs::File::open(&path).and_then(|f| f.set_times(times)) {
+                tracing::warn!("刷新资源 mtime 失败: {filename} - {e}");
+            }
             tracing::debug!("资源已存在，跳过: {filename}");
         }
 
         Ok(path)
     }
 
-    /// 清理过期资源文件（超过 3 天），返回清理数量
-    pub fn cleanup_expired(&self) -> Result<usize> {
+    /// 清理过期资源文件，返回清理数量
+    ///
+    /// # Arguments
+    ///
+    /// * `retention` - 保留天数
+    pub fn cleanup_expired(&self, retention: u32) -> Result<usize> {
+        let resource_ttl = Duration::from_secs(u64::from(retention) * 24 * 3600);
         let dir = match std::fs::read_dir(&self.save_dir) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -95,7 +103,7 @@ impl ResourceStore {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            if now.duration_since(modified).unwrap_or_default() > RESOURCE_TTL {
+            if now.duration_since(modified).unwrap_or_default() > resource_ttl {
                 if let Err(e) = std::fs::remove_file(&path) {
                     tracing::warn!("删除过期资源失败: {} - {e}", path.display());
                 } else {
@@ -193,7 +201,7 @@ mod tests {
         // 空目录，清理应返回 0
         let dir = make_temp_dir();
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -206,7 +214,7 @@ mod tests {
         std::fs::write(&file_path, b"content").unwrap();
 
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 0);
         assert!(file_path.exists());
 
@@ -228,7 +236,7 @@ mod tests {
         assert!(status.success(), "touch -t 应成功");
 
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 1);
         assert!(!file_path.exists());
 
@@ -239,7 +247,7 @@ mod tests {
     fn test_cleanup_expired_returns_zero_for_nonexistent_dir() {
         // 目录不存在时应返回 0（而非错误）
         let store = ResourceStore::new(Path::new("/nonexistent/path/that/does/not/exist"));
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -270,7 +278,7 @@ mod tests {
         std::fs::create_dir_all(&sub_dir).unwrap();
 
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         // 子目录不是文件，不应被计入删除数量
         assert_eq!(removed, 0);
         assert!(sub_dir.exists(), "子目录不应被删除");
@@ -296,7 +304,7 @@ mod tests {
         assert!(status.success());
 
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 1);
         assert!(!old_file.exists(), "过期文件应被删除");
         assert!(fresh_file.exists(), "新鲜文件不应被删除");
@@ -326,7 +334,7 @@ mod tests {
         }
 
         let store = ResourceStore::new(&dir);
-        let removed = store.cleanup_expired().unwrap();
+        let removed = store.cleanup_expired(3).unwrap();
         assert_eq!(removed, 3);
         for path in &files {
             assert!(!path.exists(), "过期文件 {:?} 应被删除", path);
@@ -343,8 +351,8 @@ mod tests {
         let store2 = store1.clone();
 
         // 两个实例均能正常执行 cleanup
-        assert_eq!(store1.cleanup_expired().unwrap(), 0);
-        assert_eq!(store2.cleanup_expired().unwrap(), 0);
+        assert_eq!(store1.cleanup_expired(3).unwrap(), 0);
+        assert_eq!(store2.cleanup_expired(3).unwrap(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }

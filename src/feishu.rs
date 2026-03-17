@@ -260,6 +260,8 @@ pub struct FileItem {
 pub struct FeishuClient {
     app_id: String,
     app_secret: String,
+    /// 共享 HTTP 客户端，复用连接池避免重复 TLS 握手
+    http: reqwest::Client,
     /// 缓存的 tenant_access_token，过期后自动刷新
     tenant_token: Arc<RwLock<Option<CachedToken>>>,
     /// 消息 ID 去重窗口（防止 WS 重连后重复处理）
@@ -272,6 +274,7 @@ impl FeishuClient {
         Self {
             app_id: app_id.to_owned(),
             app_secret: app_secret.to_owned(),
+            http: reqwest::Client::new(),
             tenant_token: Arc::new(RwLock::new(None)),
             seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -532,7 +535,7 @@ impl FeishuClient {
 
     /// 获取 WS 连接端点 URL 和客户端配置
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
-        let client = reqwest::Client::new();
+        let client = self.http.clone();
         let resp = client
             .post(format!("{FEISHU_WS_BASE}/callback/ws/endpoint"))
             .header("locale", "zh")
@@ -583,7 +586,7 @@ impl FeishuClient {
         let url = format!(
             "{FEISHU_API_BASE}/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}"
         );
-        let resp = reqwest::Client::new()
+        let resp = self.http.clone()
             .get(&url)
             .bearer_auth(&token)
             .send()
@@ -616,7 +619,7 @@ impl FeishuClient {
             "reply_in_thread": true,
         });
 
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -662,7 +665,7 @@ impl FeishuClient {
             "msg_type": "interactive",
         });
 
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .patch(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -708,7 +711,7 @@ impl FeishuClient {
         thread_id: &str,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
         let token = self.get_tenant_access_token().await?;
-        let client = reqwest::Client::new();
+        let client = self.http.clone();
         let mut all_messages: Vec<serde_json::Value> = Vec::new();
         let mut page_token: Option<String> = None;
 
@@ -867,7 +870,7 @@ impl FeishuClient {
             size = image_data.len(),
             "上传图片到飞书"
         );
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .post(&url)
             .bearer_auth(&token)
             .multipart(form)
@@ -897,7 +900,7 @@ impl FeishuClient {
             .text("file_type", "stream")
             .text("file_name", file_name.to_string())
             .part("file", reqwest::multipart::Part::bytes(file_data.to_vec()).file_name(file_name.to_string()));
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .post(&url)
             .bearer_auth(&token)
             .multipart(form)
@@ -928,7 +931,7 @@ impl FeishuClient {
             "msg_type": "image",
             "reply_in_thread": true,
         });
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -956,7 +959,7 @@ impl FeishuClient {
             "msg_type": "file",
             "reply_in_thread": true,
         });
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = self.http.clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -975,7 +978,11 @@ impl FeishuClient {
     }
 
     /// 获取（带缓存的）tenant_access_token
+    ///
+    /// 使用 double-check 模式避免并发刷新：先读锁快速检查，
+    /// 未命中时获取写锁并再次检查（可能已被其他任务刷新）。
     pub async fn get_tenant_access_token(&self) -> anyhow::Result<String> {
+        // 快速路径：读锁检查缓存
         {
             let cached = self.tenant_token.read().await;
             if let Some(ref token) = *cached {
@@ -985,7 +992,15 @@ impl FeishuClient {
             }
         }
 
-        let client = reqwest::Client::new();
+        // 慢路径：获取写锁，double-check 防止并发重复刷新
+        let mut cached = self.tenant_token.write().await;
+        if let Some(ref token) = *cached {
+            if Instant::now() < token.refresh_after {
+                return Ok(token.value.clone());
+            }
+        }
+
+        let client = self.http.clone();
         let data: serde_json::Value = client
             .post(format!(
                 "{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal"
@@ -1028,13 +1043,10 @@ impl FeishuClient {
                 .checked_sub(TOKEN_REFRESH_SKEW)
                 .unwrap_or(Duration::from_secs(1));
 
-        {
-            let mut cached = self.tenant_token.write().await;
-            *cached = Some(CachedToken {
-                value: token.clone(),
-                refresh_after,
-            });
-        }
+        *cached = Some(CachedToken {
+            value: token.clone(),
+            refresh_after,
+        });
 
         Ok(token)
     }

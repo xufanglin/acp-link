@@ -10,10 +10,19 @@ use agent_client_protocol::{
     SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
 };
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::KiroConfig;
+
+/// 流式事件：文本 chunk 或 tool call 状态
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// 文本增量
+    Text(String),
+    /// 工具调用中（显示标题让用户知道正在做什么）
+    ToolCall(String),
+}
 
 /// FNV-1a 64 位稳定哈希（跨 Rust 版本和进程重启结果完全一致）
 fn stable_hash(s: &str) -> u64 {
@@ -50,7 +59,7 @@ fn select_permission_option(
 /// - 会话通知：将 agent 响应文本 chunk 转发到 `chunk_tx` channel
 struct AcpClientHandler {
     /// 当前活跃 prompt 的 chunk 发送端，prompt 结束时置为 None
-    chunk_tx: Rc<RefCell<Option<mpsc::UnboundedSender<String>>>>,
+    chunk_tx: Rc<RefCell<Option<mpsc::UnboundedSender<StreamEvent>>>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -76,13 +85,22 @@ impl Client for AcpClientHandler {
         match &args.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let ContentBlock::Text(text) = &chunk.content {
+                    tracing::trace!("chunk: {:?}", text.text);
                     if let Some(tx) = self.chunk_tx.borrow().as_ref() {
-                        let _ = tx.send(text.text.clone());
+                        let _ = tx.send(StreamEvent::Text(text.text.clone()));
                     }
                 }
             }
             SessionUpdate::ToolCall(tc) => {
-                tracing::debug!("工具调用: {:?} ({})", tc.title, tc.tool_call_id.0);
+                let title = if tc.title.is_empty() {
+                    "工具调用".to_string()
+                } else {
+                    tc.title.clone()
+                };
+                tracing::debug!("工具调用: {title} ({})", tc.tool_call_id.0);
+                if let Some(tx) = self.chunk_tx.borrow().as_ref() {
+                    let _ = tx.send(StreamEvent::ToolCall(title));
+                }
             }
             _ => {}
         }
@@ -104,7 +122,7 @@ enum AcpCommand {
     Prompt {
         session_id: String,
         content: Vec<ContentBlock>,
-        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<String>>>,
+        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<StreamEvent>>>,
     },
 }
 
@@ -136,7 +154,7 @@ async fn acp_event_loop(
     let stdin = child.stdin.take().context("获取 kiro-cli stdin 失败")?;
     let stdout = child.stdout.take().context("获取 kiro-cli stdout 失败")?;
 
-    let chunk_tx = Rc::new(RefCell::new(None::<mpsc::UnboundedSender<String>>));
+    let chunk_tx = Rc::new(RefCell::new(None::<mpsc::UnboundedSender<StreamEvent>>));
     let handler = AcpClientHandler {
         chunk_tx: chunk_tx.clone(),
     };
@@ -242,7 +260,8 @@ async fn acp_event_loop(
         }
     }
 
-    drop(child);
+    // 确保子进程退出（tokio Child::drop 不会 kill 子进程）
+    let _ = child.kill().await;
     Ok(())
 }
 
@@ -276,6 +295,51 @@ fn spawn_worker(
         .with_context(|| format!("启动 ACP 工作线程 {worker_id} 失败"))?;
 
     Ok((cmd_tx, ready_rx))
+}
+
+/// 启动 keepalive worker 并等待其就绪（10 秒超时）
+async fn spawn_and_wait_keepalive(config: &KiroConfig) -> Result<mpsc::Sender<AcpCommand>> {
+    let (tx, ready_rx) = spawn_worker(usize::MAX, config)?;
+    match tokio::time::timeout(tokio::time::Duration::from_secs(10), ready_rx).await {
+        Err(_) => anyhow::bail!("keepalive worker 初始化超时"),
+        Ok(Err(_)) => anyhow::bail!("keepalive worker 已退出"),
+        Ok(Ok(Err(e))) => anyhow::bail!("keepalive worker 初始化失败: {e}"),
+        Ok(Ok(Ok(()))) => Ok(tx),
+    }
+}
+
+/// 执行一次 keepalive 心跳：创建临时 session → 发送轻量 prompt → 消费响应
+async fn keepalive_once(tx: &mpsc::Sender<AcpCommand>, cwd: &std::path::Path) -> Result<()> {
+    // 1) 创建临时 session
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(AcpCommand::NewSession {
+        cwd: cwd.to_owned(),
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("keepalive worker 已断开"))?;
+
+    let session_id = reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("keepalive worker 已退出"))?
+        .context("创建 keepalive session 失败")?;
+
+    // 2) 发送轻量 prompt
+    let (prompt_tx, prompt_rx) = oneshot::channel();
+    tx.send(AcpCommand::Prompt {
+        session_id,
+        content: vec![ContentBlock::Text(TextContent::new("hello"))],
+        reply: prompt_tx,
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("keepalive worker 已断开"))?;
+
+    // 3) 消费 chunk receiver 直到结束
+    if let Ok(Ok(mut rx)) = prompt_rx.await {
+        while rx.recv().await.is_some() {}
+    }
+
+    Ok(())
 }
 
 /// ACP 桥接：通过 worker 进程池与多个 kiro-cli 进程通信
@@ -330,68 +394,79 @@ impl AcpBridge {
     ///
     /// 使用独立的 kiro-cli 进程，每 6 小时发送一次轻量 prompt，
     /// 确保认证 token 不会过期，且不阻塞业务 worker。
+    /// worker 崩溃时自动重启，最多连续重试 3 次。
     fn spawn_keepalive(&self) -> Result<()> {
-        let (tx, ready_rx) = spawn_worker(usize::MAX, &self.config)?;
-
+        let config = self.config.clone();
         let temp_dir = crate::config::AppConfig::temp_dir();
+
         tokio::spawn(async move {
-            // 等待 keepalive worker 就绪
-            match ready_rx.await {
-                Ok(Ok(())) => tracing::info!("[keepalive] worker 初始化完成"),
-                other => {
-                    tracing::error!("[keepalive] worker 初始化失败: {other:?}");
-                    return;
+            let mut tx = None::<mpsc::Sender<AcpCommand>>;
+            let interval = tokio::time::Duration::from_secs(6 * 3600);
+            let max_retries = 3u32;
+
+            // 初始启动
+            match spawn_and_wait_keepalive(&config).await {
+                Ok(sender) => {
+                    tracing::info!("[keepalive] worker 初始化完成");
+                    tx = Some(sender);
+                }
+                Err(e) => {
+                    tracing::error!("[keepalive] worker 初始化失败: {e}");
                 }
             }
 
-            let interval = tokio::time::Duration::from_secs(6 * 3600);
             loop {
                 tokio::time::sleep(interval).await;
+
+                // 如果没有 worker，尝试重启
+                if tx.is_none() {
+                    match spawn_and_wait_keepalive(&config).await {
+                        Ok(sender) => {
+                            tracing::info!("[keepalive] worker 重启成功");
+                            tx = Some(sender);
+                        }
+                        Err(e) => {
+                            tracing::error!("[keepalive] worker 重启失败: {e}");
+                            continue;
+                        }
+                    }
+                }
+
+                let sender = tx.as_ref().unwrap();
                 tracing::info!("[keepalive] 开始保活心跳");
 
-                // 1) 创建临时 session
-                let (reply_tx, reply_rx) = oneshot::channel();
-                if tx
-                    .send(AcpCommand::NewSession {
-                        cwd: temp_dir.clone(),
-                        reply: reply_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!("[keepalive] worker 已断开");
-                    return;
-                }
-
-                let session_id = match reply_rx.await {
-                    Ok(Ok(sid)) => sid,
-                    other => {
-                        tracing::warn!("[keepalive] 创建 session 失败: {other:?}");
-                        continue;
+                let result = keepalive_once(sender, &temp_dir).await;
+                match result {
+                    Ok(()) => {
+                        tracing::info!("[keepalive] 心跳完成");
                     }
-                };
+                    Err(e) => {
+                        tracing::warn!("[keepalive] 心跳失败: {e}，尝试重启 worker");
+                        tx = None;
 
-                // 2) 发送轻量 prompt
-                let (prompt_tx, prompt_rx) = oneshot::channel();
-                if tx
-                    .send(AcpCommand::Prompt {
-                        session_id,
-                        content: vec![ContentBlock::Text(TextContent::new("hello"))],
-                        reply: prompt_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!("[keepalive] worker 已断开");
-                    return;
+                        // 立即重试（带退避）
+                        for attempt in 1..=max_retries {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                u64::from(attempt) * 5,
+                            ))
+                            .await;
+                            match spawn_and_wait_keepalive(&config).await {
+                                Ok(sender) => {
+                                    tracing::info!(
+                                        "[keepalive] worker 重启成功 (attempt {attempt})"
+                                    );
+                                    tx = Some(sender);
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "[keepalive] worker 重启失败 (attempt {attempt}): {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
-
-                // 消费 chunk receiver 直到结束
-                if let Ok(Ok(mut rx)) = prompt_rx.await {
-                    while rx.recv().await.is_some() {}
-                }
-
-                tracing::info!("[keepalive] 心跳完成");
             }
         });
 
@@ -426,11 +501,8 @@ impl AcpBridge {
                     Err(tokio::sync::mpsc::error::SendError(cmd)) => {
                         tracing::warn!("[worker-{idx}] 进程已崩溃，正在重启...");
                         let (new_tx, ready_rx) = spawn_worker(idx, &self.config)?;
-                        match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(10),
-                            ready_rx,
-                        )
-                        .await
+                        match tokio::time::timeout(tokio::time::Duration::from_secs(10), ready_rx)
+                            .await
                         {
                             Err(_) => anyhow::bail!("[worker-{idx}] 重启超时"),
                             Ok(Err(_)) => {
@@ -492,7 +564,7 @@ impl AcpBridge {
         routing_key: &str,
         session_id: &str,
         content: Vec<ContentBlock>,
-    ) -> Result<mpsc::UnboundedReceiver<String>> {
+    ) -> Result<mpsc::UnboundedReceiver<StreamEvent>> {
         let (reply, rx) = oneshot::channel();
         self.send_cmd(
             routing_key,
@@ -813,7 +885,11 @@ mod tests {
         let key = "persistent_thread_id";
         let first = bridge.route_idx(key);
         for _ in 0..10 {
-            assert_eq!(bridge.route_idx(key), first, "路由结果应在多次调用中保持一致");
+            assert_eq!(
+                bridge.route_idx(key),
+                first,
+                "路由结果应在多次调用中保持一致"
+            );
         }
     }
 

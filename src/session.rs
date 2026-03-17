@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Session 过期时间：3 天
-const SESSION_TTL: Duration = Duration::from_secs(3 * 24 * 3600);
 
 /// 飞书 thread_id 与 ACP session_id 的映射，持久化到磁盘
 ///
@@ -119,9 +116,14 @@ impl SessionMap {
         self.flush()
     }
 
-    /// 清理过期 session（超过 3 天），返回清理数量
-    pub fn cleanup_expired(&mut self) -> Result<usize> {
-        let cutoff = now_secs().saturating_sub(SESSION_TTL.as_secs());
+    /// 清理过期 session，返回清理数量
+    ///
+    /// # Arguments
+    ///
+    /// * `retention` - 保留天数
+    pub fn cleanup_expired(&mut self, retention: u32) -> Result<usize> {
+        let ttl_secs = u64::from(retention) * 24 * 3600;
+        let cutoff = now_secs().saturating_sub(ttl_secs);
         let before = self.entries.len();
         self.entries.retain(|_, e| e.created_at > cutoff);
         let removed = before - self.entries.len();
@@ -345,7 +347,7 @@ mod tests {
         let mut map = SessionMap::load(&path).unwrap();
         assert_eq!(map.len(), 2);
 
-        let removed = map.cleanup_expired().unwrap();
+        let removed = map.cleanup_expired(3).unwrap();
         assert_eq!(removed, 1);
         assert_eq!(map.len(), 1);
         assert!(map.get_session_id("thread_old").is_none());
@@ -360,7 +362,7 @@ mod tests {
         let (dir, mut map) = make_session_map();
         map.insert("thread_001", "session_abc").unwrap();
 
-        let removed = map.cleanup_expired().unwrap();
+        let removed = map.cleanup_expired(3).unwrap();
         assert_eq!(removed, 0);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -414,7 +416,7 @@ mod tests {
         // 过期前 thread_index 应能查到
         assert_eq!(map.get_thread_id("msg_old"), Some("thread_old"));
 
-        let removed = map.cleanup_expired().unwrap();
+        let removed = map.cleanup_expired(3).unwrap();
         assert_eq!(removed, 1);
         // cleanup 后 thread_index 也应移除对应记录
         assert!(map.get_thread_id("msg_old").is_none());

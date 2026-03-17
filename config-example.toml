@@ -1,6 +1,10 @@
 log_level = "debug"
 # 日志保留天数，默认 7 天
-# log_keep_days = 7
+# log_retention = 7
+# Session 保留天数，默认 7 天
+# session_retention = 7
+# 资源文件保留天数，默认 7 天
+# resource_retention = 7
 
 [feishu]
 app_id = "cli_xxxxxxx"

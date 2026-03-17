@@ -88,25 +88,21 @@ async fn handle_post(
         }
     }
 
-    let (resp, new_session) = match method {
+    let resp = match method {
         "initialize" => {
             let sid = uuid::Uuid::new_v4().to_string();
-            *state.session_id.write().await = Some(sid.clone());
-            (handle_initialize(&id), Some(sid))
+            *state.session_id.write().await = Some(sid);
+            handle_initialize(&id)
         }
-        "tools/list" => (handle_tools_list(&id), None),
-        "tools/call" => (handle_tools_call(&id, &params, &state.client).await, None),
-        _ => (
-            make_error(&id, -32601, &format!("Method not found: {method}")),
-            None,
-        ),
+        "tools/list" => handle_tools_list(&id),
+        "tools/call" => handle_tools_call(&id, &params, &state.client).await,
+        _ => make_error(&id, -32601, &format!("Method not found: {method}")),
     };
 
-    let session_id = new_session.or_else(|| None);
     let current_sid = state.session_id.read().await.clone();
     json_response(
         StatusCode::OK,
-        current_sid.as_deref().or(session_id.as_deref()),
+        current_sid.as_deref(),
         resp,
     )
 }

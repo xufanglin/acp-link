@@ -190,7 +190,7 @@ flowchart TD
 
 ### Token 缓存策略
 
-`tenant_access_token` 有效期通常为 7200 秒，缓存后在到期前 120 秒（`TOKEN_REFRESH_SKEW`）主动刷新，避免中间件层面出现 401。
+`tenant_access_token` 有效期通常为 7200 秒，缓存后在到期前 120 秒（`TOKEN_REFRESH_SKEW`）主动刷新，避免中间件层面出现 401。并发请求采用 double-check 模式：先读锁检查缓存，未命中时获取写锁并再次检查，确保同一时刻只有一个任务执行实际的 token 刷新请求。
 
 ```
 Token 有效期: |-------- 7200s --------|

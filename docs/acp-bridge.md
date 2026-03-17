@@ -224,7 +224,45 @@ flowchart TD
 
 ---
 
-## 8. 初始化时序
+## 8. Keepalive 心跳
+
+`AcpBridge::start()` 在所有业务 worker 就绪后，额外启动一个 keepalive worker（`worker_id = usize::MAX`），专门用于保活。
+
+### 8.1 设计目的
+
+kiro-cli 底层使用的认证 token 有有效期限制。若长时间无用户消息，所有 worker 均空闲，token 可能过期。keepalive worker 定期发送轻量 prompt，触发 kiro-cli 内部的 token 刷新机制。
+
+### 8.2 保活流程
+
+```mermaid
+sequenceDiagram
+    participant KA as keepalive task (tokio::spawn)
+    participant W as keepalive worker (OS Thread)
+    participant K as kiro-cli
+
+    loop 每 6 小时
+        KA->>W: AcpCommand::NewSession
+        W->>K: ACP NewSession
+        K-->>W: session_id
+        W-->>KA: Ok(session_id)
+
+        KA->>W: AcpCommand::Prompt("hello")
+        W->>K: ACP Prompt
+        K-->>W: AgentMessageChunk (流式)
+        W-->>KA: chunks via UnboundedReceiver
+        KA->>KA: 消费所有 chunk 直到 rx 关闭
+    end
+```
+
+### 8.3 关键设计点
+
+- **独立 worker**：keepalive 使用专用 kiro-cli 进程，不占用业务 worker 队列，不会阻塞用户请求。
+- **轻量 prompt**：仅发送 `"hello"` 文本，响应被静默消费丢弃。
+- **崩溃恢复**：心跳失败时自动重启 worker，最多连续重试 3 次（带指数退避：5s、10s、15s）。下一个 6 小时周期到来时若仍无 worker 也会再次尝试启动。初始启动失败不影响业务 worker 正常运行。
+
+---
+
+## 9. 初始化时序
 
 ```mermaid
 sequenceDiagram
@@ -244,14 +282,15 @@ sequenceDiagram
         T->>T: 进入 cmd_rx 等待循环
     end
     B->>B: 等待所有 worker ready_rx（10 秒超时）
+    B->>B: spawn_keepalive() — 启动独立保活 worker
     B-->>M: Ok(AcpBridge)
 ```
 
-每个 worker 初始化完成后通过 `oneshot::Sender<Result<()>>` 发送就绪信号。`AcpBridge::start` 等待所有 worker 就绪（10 秒超时），确保在接受命令前所有 kiro-cli 进程已完成 ACP 握手。
+每个 worker 初始化完成后通过 `oneshot::Sender<Result<()>>` 发送就绪信号。`AcpBridge::start` 等待所有 worker 就绪（10 秒超时），确保在接受命令前所有 kiro-cli 进程已完成 ACP 握手。随后启动 keepalive worker 进行定期保活（见第 8 节）。
 
 ---
 
-## 9. 错误处理
+## 10. 错误处理
 
 | 场景 | 处理方式 |
 |------|---------|
