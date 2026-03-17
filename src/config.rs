@@ -21,10 +21,19 @@ pub struct KiroConfig {
     /// kiro-cli 进程池大小，通过 thread_id hash 路由实现并行处理，默认为 4
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+    /// Agent 工作目录，用作项目上下文路径；未配置时默认为 `~/.acp-link/temp/`
+    pub cwd: Option<PathBuf>,
 }
 
 fn default_pool_size() -> usize {
     4
+}
+
+impl KiroConfig {
+    /// 返回有效的工作目录：优先使用配置的 `cwd`，否则回退到 `~/.acp-link/temp/`
+    pub fn effective_cwd(&self) -> PathBuf {
+        self.cwd.clone().unwrap_or_else(AppConfig::temp_dir)
+    }
 }
 
 fn default_log_level() -> String {

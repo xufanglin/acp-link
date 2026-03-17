@@ -624,6 +624,7 @@ mod tests {
             cmd: "false".to_string(),
             args: vec![],
             pool_size,
+            cwd: None,
         };
         let workers = (0..pool_size)
             .map(|_| {

@@ -15,6 +15,8 @@ cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 # 进程池大小，通过 thread_id hash 路由实现并行处理，默认 4
 # pool_size = 4
+# Agent 工作目录，用作项目上下文路径；未配置时默认为 ~/.acp-link/temp/
+# cwd = "/path/to/your/project"
 
 [mcp]
 # HTTP 监听端口，默认 9800

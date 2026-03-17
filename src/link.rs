@@ -57,7 +57,7 @@ impl LinkService {
         let sessions_path = data_dir.parent().unwrap_or(&data_dir).join("sessions.json");
         let session_map = SessionMap::load(&sessions_path)?;
         let bridge = AcpBridge::start(&config.kiro).await?;
-        let cwd = AppConfig::temp_dir();
+        let cwd = config.kiro.effective_cwd();
 
         // 启动内嵌 MCP HTTP Server
         let mcp_client = client.clone();
