@@ -44,7 +44,7 @@ impl IMChannel for FeishuChannel {
         result
     }
 
-    async fn reply_card(
+    async fn reply_message(
         &self,
         message_id: &str,
         markdown: &str,
@@ -52,7 +52,7 @@ impl IMChannel for FeishuChannel {
         self.client.reply_card(message_id, markdown).await
     }
 
-    async fn update_card(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
+    async fn update_message(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
         self.client.update_card(message_id, markdown).await
     }
 

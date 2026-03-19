@@ -5,7 +5,7 @@ use anyhow::Result;
 /// 入口：加载配置 → 初始化日志 → 启动 LinkService（含内嵌 MCP Server）
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("acp-link v0.3.0");
+    println!("acp-link v0.2.3");
 
     let config = acp_link::config::AppConfig::discover()?;
 

@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-acp-link 是一个 IM ↔ ACP（Agent Client Protocol）桥接服务。它通过 `IMChannel` trait 抽象层接收 IM 平台消息，通过 ACP 协议转发给本地运行的 kiro-cli agent，将 agent 的流式响应以消息卡片形式实时回复到 IM。同时内嵌一个 MCP Server，允许 agent 通过 MCP 协议反向调用 IM 平台能力（如发送文件）。
+acp-link 是一个 IM ↔ ACP（Agent Client Protocol）桥接服务。它通过 `IMChannel` trait 抽象层接收 IM 平台消息，通过 ACP 协议转发给本地运行的 kiro-cli agent，将 agent 的流式响应以富文本消息形式实时回复到 IM。同时内嵌一个 MCP Server，允许 agent 通过 MCP 协议反向调用 IM 平台能力（如发送文件）。
 
 当前支持飞书（Feishu）平台，架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
@@ -19,10 +19,10 @@ IM 用户  ──── IMChannel ────  acp-link  ──── ACP(stdio
 | 模块       | 文件                                  | 职责                                                                                                                                            |
 | ---------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | IM 抽象层  | `im.rs` + `im/feishu/channel.rs`      | `IMChannel` trait 定义、跨平台统一消息类型（`ImMessage`、`TopicSubmission` 等）；`FeishuChannel` 实现飞书平台适配                               |
-| 飞书客户端 | `im/feishu/client.rs`（`pub(crate)`） | WS 长连接、protobuf 帧解析、消息去重、token 缓存、REST API（回复/更新卡片、上传/发送文件、下载资源、拉取 thread）                               |
+| 飞书客户端 | `im/feishu/client.rs`（`pub(crate)`） | WS 长连接、protobuf 帧解析、消息去重、token 缓存、REST API（回复/更新消息、上传/发送文件、下载资源、拉取 thread）                               |
 | 飞书 MCP   | `im/feishu/mcp_tools.rs`              | 飞书平台 MCP Tool 定义（如 `feishu_send_file`）                                                                                                 |
 | ACP 桥接   | `link/acp.rs`                         | kiro-cli 子进程池、`!Send` runtime 隔离、FNV-1a 稳定 hash 路由、流式 chunk 转发、权限自动批准、worker 崩溃自动重启、keepalive 心跳（每 6 小时） |
-| 核心服务   | `link.rs`                             | 消息分发、session 生命周期管理、content block 构建、卡片流式更新节流（300ms）、优雅关机                                                         |
+| 核心服务   | `link.rs`                             | 消息分发、session 生命周期管理、content block 构建、消息流式更新节流（300ms）、优雅关机                                                         |
 | 会话映射   | `link/session.rs`                     | topic_id ↔ session_id 双向映射、message_id → topic_id 反向索引、JSON 原子持久化（tmp+rename）、按配置天数过期清理（默认 7 天）                  |
 | 资源存储   | `link/resource.rs`                    | 通过 `IMChannel` trait 下载资源、SHA256 去重落盘、`file://` URI、按配置天数过期清理（默认 7 天）                                                |
 | 配置管理   | `config.rs`                           | TOML 解析、`im_platform` 平台选择、优先级查找（环境变量 > 当前目录 > `~/.acp-link/`）、自动生成默认配置                                         |
@@ -80,8 +80,8 @@ sequenceDiagram
     C->>C: 消息去重（30min 窗口）
     C-->>L: ImMessage (mpsc channel)
 
-    L->>C: reply_card("...") → 创建占位卡片
-    C-->>L: (card_msg_id, topic_id)
+    L->>C: reply_message("...") → 创建占位消息
+    C-->>L: (reply_msg_id, topic_id)
     L->>S: map_topic(message_id, topic_id)
 
     alt 已有 session（增量模式）
@@ -104,8 +104,8 @@ sequenceDiagram
     A-->>L: chunk (UnboundedReceiver<String>)
 
     loop 每 300ms 或流结束
-        L->>C: update_card(card_msg_id, full_text)
-        C->>U: 卡片实时更新
+        L->>C: update_message(reply_msg_id, full_text)
+        C->>U: 消息实时更新
     end
 
     opt agent 需要发送文件

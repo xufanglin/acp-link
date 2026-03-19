@@ -19,8 +19,8 @@ use self::session::SessionMap;
 use crate::config::AppConfig;
 use crate::im::{IMChannel, ImMessage, ImMessageContent};
 
-/// 卡片流式更新的节流间隔
-const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
+/// 消息流式更新的节流间隔
+const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
@@ -252,8 +252,8 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
             } else {
                 "收到，请继续输入指令"
             };
-            match state.channel.reply_card(&msg.message_id, hint).await {
-                Ok((card_msg_id, thread_id)) => {
+            match state.channel.reply_message(&msg.message_id, hint).await {
+                Ok((reply_msg_id, thread_id)) => {
                     if let Err(e) = state
                         .session_map
                         .write()
@@ -263,11 +263,11 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                         tracing::error!("持久化 thread 映射失败: {e}");
                     }
                     if is_text {
-                        stream_acp_with_card(&state, &thread_id, &msg.chat_id, &card_msg_id, &msg)
+                        stream_acp_reply(&state, &thread_id, &msg.chat_id, &reply_msg_id, &msg)
                             .await;
                     }
                 }
-                Err(e) => tracing::error!("创建卡片话题失败: {e}"),
+                Err(e) => tracing::error!("创建消息话题失败: {e}"),
             }
         }
         Some(root_id) => {
@@ -291,7 +291,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                     } else {
                         if let Err(e) = state
                             .channel
-                            .reply_card(&msg.message_id, "收到附件，请回复文字指令来处理它")
+                            .reply_message(&msg.message_id, "收到附件，请回复文字指令来处理它")
                             .await
                         {
                             tracing::error!("回复附件提示失败: {e}");
@@ -305,8 +305,8 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                     } else {
                         "收到，请继续输入指令"
                     };
-                    match state.channel.reply_card(&msg.message_id, hint).await {
-                        Ok((card_msg_id, thread_id)) => {
+                    match state.channel.reply_message(&msg.message_id, hint).await {
+                        Ok((reply_msg_id, thread_id)) => {
                             if let Err(e) = state
                                 .session_map
                                 .write()
@@ -316,17 +316,17 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                                 tracing::error!("持久化 thread 映射失败: {e}");
                             }
                             if is_text {
-                                stream_acp_with_card(
+                                stream_acp_reply(
                                     &state,
                                     &thread_id,
                                     &msg.chat_id,
-                                    &card_msg_id,
+                                    &reply_msg_id,
                                     &msg,
                                 )
                                 .await;
                             }
                         }
-                        Err(e) => tracing::error!("创建卡片话题失败: {e}"),
+                        Err(e) => tracing::error!("创建消息话题失败: {e}"),
                     }
                 }
             }
@@ -334,7 +334,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
     }
 }
 
-/// 已有 thread 内的文本消息：reply_card 和 prepare_prompt 并行，然后流式更新
+/// 已有 thread 内的文本消息：reply_message 和 prepare_prompt 并行，然后流式更新
 async fn submit_to_acp_streaming(
     state: &Arc<SharedState>,
     thread_id: &str,
@@ -342,72 +342,71 @@ async fn submit_to_acp_streaming(
     reply_to_message_id: &str,
     msg: &ImMessage,
 ) {
-    let card_fut = state.channel.reply_card(reply_to_message_id, "...");
+    let reply_fut = state.channel.reply_message(reply_to_message_id, "...");
     let prompt_fut = prepare_prompt(state, thread_id, chat_id, msg);
-    let (card_result, prompt_result) = tokio::join!(card_fut, prompt_fut);
+    let (reply_result, prompt_result) = tokio::join!(reply_fut, prompt_fut);
 
-    let card_msg_id = match card_result {
-        Ok((card_msg_id, _)) => card_msg_id,
+    let reply_msg_id = match reply_result {
+        Ok((reply_msg_id, _)) => reply_msg_id,
         Err(e) => {
-            tracing::error!("创建卡片失败: {e}");
+            tracing::error!("创建回复消息失败: {e}");
             return;
         }
     };
 
     match prompt_result {
         Ok((session_id, blocks)) => {
-            stream_acp_with_card_prepared(state, thread_id, &session_id, &card_msg_id, blocks)
-                .await;
+            stream_acp_reply_prepared(state, thread_id, &session_id, &reply_msg_id, blocks).await;
         }
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
             let _ = state
                 .channel
-                .update_card(&card_msg_id, &format!("处理失败: {e}"))
+                .update_message(&reply_msg_id, &format!("处理失败: {e}"))
                 .await;
         }
     }
 }
 
-/// 构建 blocks → 发送 ACP prompt → 流式更新卡片
-async fn stream_acp_with_card(
+/// 构建 blocks → 发送 ACP prompt → 流式更新回复消息
+async fn stream_acp_reply(
     state: &Arc<SharedState>,
     thread_id: &str,
     chat_id: &str,
-    card_message_id: &str,
+    reply_message_id: &str,
     msg: &ImMessage,
 ) {
     let prompt_result = prepare_prompt(state, thread_id, chat_id, msg).await;
     match prompt_result {
         Ok((session_id, blocks)) => {
-            stream_acp_with_card_prepared(state, thread_id, &session_id, card_message_id, blocks)
+            stream_acp_reply_prepared(state, thread_id, &session_id, reply_message_id, blocks)
                 .await;
         }
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
             let _ = state
                 .channel
-                .update_card(card_message_id, &format!("处理失败: {e}"))
+                .update_message(reply_message_id, &format!("处理失败: {e}"))
                 .await;
         }
     }
 }
 
-/// 已准备好 prompt 的流式处理：发送到 ACP → 接收 chunk 并节流更新卡片
-async fn stream_acp_with_card_prepared(
+/// 已准备好 prompt 的流式处理：发送到 ACP → 接收 chunk 并节流更新回复消息
+async fn stream_acp_reply_prepared(
     state: &Arc<SharedState>,
     routing_key: &str,
     session_id: &str,
-    card_message_id: &str,
+    reply_message_id: &str,
     blocks: Vec<ContentBlock>,
 ) {
-    match do_stream_prepared(state, routing_key, session_id, card_message_id, blocks).await {
+    match do_stream_prepared(state, routing_key, session_id, reply_message_id, blocks).await {
         Ok(()) => {}
         Err(e) => {
             tracing::error!("流式处理失败: {e}");
             let _ = state
                 .channel
-                .update_card(card_message_id, &format!("处理失败: {e}"))
+                .update_message(reply_message_id, &format!("处理失败: {e}"))
                 .await;
         }
     }
@@ -448,7 +447,7 @@ async fn prepare_prompt(
                 _ => anyhow::bail!("增量模式仅支持文本消息"),
             };
             let context = format!(
-                "[feishu_context: message_id={}, chat_id={}]\n\n{}",
+                "[im_context: message_id={}, chat_id={}]\n\n{}",
                 msg.message_id, msg.chat_id, text
             );
             Ok((session_id, vec![AcpBridge::text_block(&context)]))
@@ -502,11 +501,11 @@ async fn prepare_prompt(
                 blocks.push(AcpBridge::resource_link_block(&file.file_name, &uri, mime));
             }
 
-            // 在最前面注入 feishu_context，供 agent 提取 message_id
+            // 在最前面注入 im_context，供 agent 提取 message_id
             blocks.insert(
                 0,
                 AcpBridge::text_block(&format!(
-                    "[feishu_context: message_id={}, chat_id={}]",
+                    "[im_context: message_id={}, chat_id={}]",
                     msg.message_id, msg.chat_id
                 )),
             );
@@ -528,12 +527,12 @@ async fn prepare_prompt(
     }
 }
 
-/// 核心流式处理：发送到 ACP → 接收 chunk 并节流更新卡片（prompt 已准备好）
+/// 核心流式处理：发送到 ACP → 接收 chunk 并节流更新回复消息（prompt 已准备好）
 async fn do_stream_prepared(
     state: &Arc<SharedState>,
     routing_key: &str,
     session_id: &str,
-    card_message_id: &str,
+    reply_message_id: &str,
     blocks: Vec<ContentBlock>,
 ) -> Result<()> {
     for (i, block) in blocks.iter().enumerate() {
@@ -564,12 +563,12 @@ async fn do_stream_prepared(
     tracing::debug!("ACP prompt 流开始: session={session_id}");
 
     let mut full_text = String::new();
-    // 初始时间设为"很久以前"，确保首个 chunk 立即触发卡片更新
-    let mut last_update = Instant::now() - CARD_UPDATE_INTERVAL;
+    // 初始时间设为"很久以前"，确保首个 chunk 立即触发消息更新
+    let mut last_update = Instant::now() - MESSAGE_UPDATE_INTERVAL;
     let mut dirty = false;
     let mut chunk_count: u64 = 0;
     let mut first_chunk_logged = false;
-    // 跟踪后台卡片更新任务，避免并发更新冲突
+    // 跟踪后台消息更新任务，避免并发更新冲突
     let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
     while let Some(event) = chunk_rx.recv().await {
         chunk_count += 1;
@@ -592,7 +591,7 @@ async fn do_stream_prepared(
             }
         }
 
-        if last_update.elapsed() >= CARD_UPDATE_INTERVAL {
+        if last_update.elapsed() >= MESSAGE_UPDATE_INTERVAL {
             // 如果上一次更新还在进行中，跳过本次（下次会带上所有累积 chunk）
             let should_send = match &inflight {
                 Some(h) => h.is_finished(),
@@ -600,7 +599,7 @@ async fn do_stream_prepared(
             };
             if should_send {
                 let channel = state.channel.clone();
-                let msg_id = card_message_id.to_string();
+                let msg_id = reply_message_id.to_string();
                 let trimmed = full_text.trim_start_matches('\n');
                 let text_snapshot = if in_tool_call {
                     format!("{trimmed}\n...")
@@ -609,10 +608,10 @@ async fn do_stream_prepared(
                 };
                 inflight = Some(tokio::spawn(async move {
                     let t = Instant::now();
-                    if let Err(e) = channel.update_card(&msg_id, &text_snapshot).await {
-                        tracing::warn!("更新卡片失败（将继续）: {e}");
+                    if let Err(e) = channel.update_message(&msg_id, &text_snapshot).await {
+                        tracing::warn!("更新消息失败（将继续）: {e}");
                     }
-                    tracing::debug!("卡片更新耗时: {}ms", t.elapsed().as_millis());
+                    tracing::debug!("消息更新耗时: {}ms", t.elapsed().as_millis());
                 }));
                 last_update = Instant::now();
                 dirty = false;
@@ -623,7 +622,7 @@ async fn do_stream_prepared(
     // 等待最后一次后台更新完成
     if let Some(h) = inflight {
         if let Err(e) = h.await {
-            tracing::error!("后台卡片更新任务异常: {e}");
+            tracing::error!("后台消息更新任务异常: {e}");
         }
     }
 
@@ -635,10 +634,10 @@ async fn do_stream_prepared(
         };
         if let Err(e) = state
             .channel
-            .update_card(card_message_id, &final_text)
+            .update_message(reply_message_id, &final_text)
             .await
         {
-            tracing::error!("最终更新卡片失败: {e}");
+            tracing::error!("最终更新消息失败: {e}");
         }
     }
 

@@ -107,15 +107,17 @@ pub trait IMChannel: Send + Sync {
     /// 连接并持续监听消息，断开时返回 Ok(())，由调用方决定重连
     async fn listen(&self, tx: mpsc::Sender<ImMessage>) -> anyhow::Result<()>;
 
-    /// 回复消息卡片，返回 (new_message_id, topic_id)
-    async fn reply_card(
+    /// 回复富文本消息（Markdown），返回 (new_message_id, topic_id)
+    /// 各平台实现自行决定渲染方式
+    async fn reply_message(
         &self,
         message_id: &str,
         markdown: &str,
     ) -> anyhow::Result<(String, String)>;
 
-    /// 更新已有消息卡片内容
-    async fn update_card(&self, message_id: &str, markdown: &str) -> anyhow::Result<()>;
+    /// 更新已有消息内容
+    /// 各平台实现自行决定更新机制
+    async fn update_message(&self, message_id: &str, markdown: &str) -> anyhow::Result<()>;
 
     /// 下载消息中的资源（图片/文件）
     async fn download_resource(

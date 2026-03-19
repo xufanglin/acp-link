@@ -8,7 +8,7 @@ use super::client::FeishuClient;
 pub fn list() -> Vec<Value> {
     vec![json!({
         "name": "feishu_send_file",
-        "description": "Upload and send a file to the current Feishu chat thread. For image files (.png/.jpg/.gif/.webp/.bmp), sent as inline image; otherwise as file attachment. Extract message_id from [feishu_context] in the conversation.",
+        "description": "Upload and send a file to the current Feishu chat thread. For image files (.png/.jpg/.gif/.webp/.bmp), sent as inline image; otherwise as file attachment. Extract message_id from [im_context] in the conversation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -18,7 +18,7 @@ pub fn list() -> Vec<Value> {
                 },
                 "message_id": {
                     "type": "string",
-                    "description": "The Feishu message_id to reply to (from feishu_context)"
+                    "description": "The Feishu message_id to reply to (from im_context)"
                 },
                 "file_name": {
                     "type": "string",

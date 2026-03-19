@@ -2,14 +2,14 @@
 
 IM ↔ ACP (Agent Client Protocol) 桥接服务，使用 Rust 编写。
 
-通过 `IMChannel` trait 抽象层监听 IM 平台消息，通过 ACP 协议将内容转发给 kiro-cli agent，并将 agent 的流式响应以消息卡片形式回复到 IM。当前支持飞书（Feishu）平台，架构设计支持扩展到钉钉、Slack 等其他 IM。
+通过 `IMChannel` trait 抽象层监听 IM 平台消息，通过 ACP 协议将内容转发给 kiro-cli agent，并将 agent 的流式响应以富文本消息形式实时回复到 IM。当前支持飞书（Feishu）平台，架构设计支持扩展到钉钉、Slack 等其他 IM。
 
 ## 功能特性
 
 - **IM 平台抽象** — 通过 `IMChannel` trait 支持多 IM 平台，当前内置飞书
 - **多媒体消息支持** — 文本、图片、文件、音频、视频、表情包
 - **Topic 话题聚合** — 首条消息聚合整个 topic 上下文，后续消息增量追加
-- **消息卡片流式更新** — 流式展示 agent 响应
+- **消息流式更新** — 流式展示 agent 响应
 - **内嵌 MCP Server** — 暴露 IM 平台工具（如文件发送）供 agent 调用
 - **Session 持久化** — 自动过期清理，支持断点续聊
 
@@ -242,12 +242,12 @@ impl IMChannel for DingtalkChannel {
         todo!()
     }
 
-    async fn reply_card(&self, message_id: &str, markdown: &str) -> anyhow::Result<(String, String)> {
-        // 回复消息卡片，返回 (new_message_id, topic_id)
+    async fn reply_message(&self, message_id: &str, markdown: &str) -> anyhow::Result<(String, String)> {
+        // 回复富文本消息，返回 (new_message_id, topic_id)
         todo!()
     }
 
-    // ... 实现其余方法（update_card, download_resource, aggregate_topic 等）
+    // ... 实现其余方法（update_message, download_resource, aggregate_topic 等）
     // ... 以及 mcp_tool_list / mcp_tool_call 注册平台专属 MCP 工具
 }
 ```
@@ -255,7 +255,7 @@ impl IMChannel for DingtalkChannel {
 关键方法说明：
 
 - `listen` — 持续监听消息源，将平台消息转换为统一的 `ImMessage`
-- `reply_card` / `update_card` — 消息卡片的创建与流式更新
+- `reply_message` / `update_message` — 富文本消息的创建与流式更新（各平台自行决定渲染方式）
 - `aggregate_topic` — 聚合 topic 内所有用户消息（用于首次全量上下文构建）
 - `mcp_tool_list` / `mcp_tool_call` — 注册和执行平台专属的 MCP 工具
 
