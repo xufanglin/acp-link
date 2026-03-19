@@ -1,3 +1,7 @@
+mod acp;
+mod resource;
+mod session;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,19 +12,20 @@ use tokio::time::{Duration, Instant};
 
 use std::collections::HashSet;
 
-use crate::acp::{AcpBridge, StreamEvent};
+use self::acp::{AcpBridge, StreamEvent};
+use self::resource::ResourceStore;
+use self::session::SessionMap;
+
 use crate::config::AppConfig;
-use crate::feishu::{FeishuClient, FeishuMessage, MessageContent};
-use crate::resource::ResourceStore;
-use crate::session::SessionMap;
+use crate::im::{IMChannel, ImMessage, ImMessageContent};
 
 /// 卡片流式更新的节流间隔
 const CARD_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
-    /// 飞书 API 客户端（WS 监听 + REST 调用）
-    client: FeishuClient,
+    /// IM channel（平台无关）
+    channel: Arc<dyn IMChannel>,
     /// ACP 桥接（kiro-cli 进程池）
     bridge: AcpBridge,
     /// 资源文件存储（SHA256 去重）
@@ -41,7 +46,7 @@ struct SharedState {
     log_dir: PathBuf,
 }
 
-/// Link 服务：飞书消息监听 → ACP 转发 → 回复
+/// Link 服务：IM 消息监听 → ACP 转发 → 回复
 ///
 /// 内部通过 `Arc<SharedState>` 共享状态，支持多条消息并发处理。
 pub struct LinkService {
@@ -50,8 +55,7 @@ pub struct LinkService {
 
 impl LinkService {
     /// 从配置初始化所有组件
-    pub async fn new(config: &AppConfig) -> Result<Self> {
-        let client = FeishuClient::new(&config.feishu.app_id, &config.feishu.app_secret);
+    pub async fn new(config: &AppConfig, channel: Arc<dyn IMChannel>) -> Result<Self> {
         let data_dir = AppConfig::data_dir();
         let resource_store = ResourceStore::new(&data_dir);
         let sessions_path = data_dir.parent().unwrap_or(&data_dir).join("sessions.json");
@@ -60,17 +64,17 @@ impl LinkService {
         let cwd = config.kiro.effective_cwd();
 
         // 启动内嵌 MCP HTTP Server
-        let mcp_client = client.clone();
+        let mcp_channel = channel.clone();
         let mcp_port = config.mcp.port;
         tokio::spawn(async move {
-            if let Err(e) = crate::mcp::start_mcp_server(mcp_client, mcp_port).await {
+            if let Err(e) = crate::mcp::start_mcp_server(mcp_channel, mcp_port).await {
                 tracing::error!("MCP Server 异常退出: {e}");
             }
         });
 
         Ok(Self {
             state: Arc::new(SharedState {
-                client,
+                channel,
                 bridge,
                 resource_store,
                 session_map: RwLock::new(session_map),
@@ -84,13 +88,13 @@ impl LinkService {
         })
     }
 
-    /// 运行主循环：监听飞书消息 + 定期清理 session + 优雅关机
+    /// 运行主循环：监听 IM 消息 + 定期清理 session + 优雅关机
     pub async fn run(&self) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let client_clone = self.state.client.clone();
+        let channel_clone = self.state.channel.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = client_clone.listen(tx.clone()).await {
+                if let Err(e) = channel_clone.listen(tx.clone()).await {
                     tracing::error!("WS error: {e}, reconnecting...");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
@@ -230,8 +234,8 @@ fn cleanup_temp_dir(retention: u32) -> Result<usize> {
     Ok(removed)
 }
 
-/// 处理单条飞书消息：根据是否有 thread 上下文决定新建会话或增量追加
-async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
+/// 处理单条 IM 消息：根据是否有 topic 上下文决定新建会话或增量追加
+async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
     tracing::info!(
         "[{}] {} message_id: {}",
         msg.chat_id,
@@ -241,20 +245,20 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
 
     let is_text = is_text_message(&msg);
 
-    match &msg.root_id {
+    match &msg.topic_id {
         None => {
             let hint = if is_text {
                 "..."
             } else {
                 "收到，请继续输入指令"
             };
-            match state.client.reply_card(&msg.message_id, hint).await {
+            match state.channel.reply_card(&msg.message_id, hint).await {
                 Ok((card_msg_id, thread_id)) => {
                     if let Err(e) = state
                         .session_map
                         .write()
                         .await
-                        .map_thread(&msg.message_id, &thread_id)
+                        .map_topic(&msg.message_id, &thread_id)
                     {
                         tracing::error!("持久化 thread 映射失败: {e}");
                     }
@@ -271,7 +275,7 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
                 .session_map
                 .read()
                 .await
-                .get_thread_id(root_id)
+                .get_topic_id(root_id)
                 .map(str::to_owned);
             match thread_id {
                 Some(thread_id) => {
@@ -286,7 +290,7 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
                         .await;
                     } else {
                         if let Err(e) = state
-                            .client
+                            .channel
                             .reply_card(&msg.message_id, "收到附件，请回复文字指令来处理它")
                             .await
                         {
@@ -301,13 +305,13 @@ async fn handle_message(state: Arc<SharedState>, msg: FeishuMessage) {
                     } else {
                         "收到，请继续输入指令"
                     };
-                    match state.client.reply_card(&msg.message_id, hint).await {
+                    match state.channel.reply_card(&msg.message_id, hint).await {
                         Ok((card_msg_id, thread_id)) => {
                             if let Err(e) = state
                                 .session_map
                                 .write()
                                 .await
-                                .map_thread(root_id, &thread_id)
+                                .map_topic(root_id, &thread_id)
                             {
                                 tracing::error!("持久化 thread 映射失败: {e}");
                             }
@@ -336,9 +340,9 @@ async fn submit_to_acp_streaming(
     thread_id: &str,
     chat_id: &str,
     reply_to_message_id: &str,
-    msg: &FeishuMessage,
+    msg: &ImMessage,
 ) {
-    let card_fut = state.client.reply_card(reply_to_message_id, "...");
+    let card_fut = state.channel.reply_card(reply_to_message_id, "...");
     let prompt_fut = prepare_prompt(state, thread_id, chat_id, msg);
     let (card_result, prompt_result) = tokio::join!(card_fut, prompt_fut);
 
@@ -358,7 +362,7 @@ async fn submit_to_acp_streaming(
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
             let _ = state
-                .client
+                .channel
                 .update_card(&card_msg_id, &format!("处理失败: {e}"))
                 .await;
         }
@@ -371,7 +375,7 @@ async fn stream_acp_with_card(
     thread_id: &str,
     chat_id: &str,
     card_message_id: &str,
-    msg: &FeishuMessage,
+    msg: &ImMessage,
 ) {
     let prompt_result = prepare_prompt(state, thread_id, chat_id, msg).await;
     match prompt_result {
@@ -382,7 +386,7 @@ async fn stream_acp_with_card(
         Err(e) => {
             tracing::error!("准备 prompt 失败: {e}");
             let _ = state
-                .client
+                .channel
                 .update_card(card_message_id, &format!("处理失败: {e}"))
                 .await;
         }
@@ -402,7 +406,7 @@ async fn stream_acp_with_card_prepared(
         Err(e) => {
             tracing::error!("流式处理失败: {e}");
             let _ = state
-                .client
+                .channel
                 .update_card(card_message_id, &format!("处理失败: {e}"))
                 .await;
         }
@@ -414,7 +418,7 @@ async fn prepare_prompt(
     state: &Arc<SharedState>,
     thread_id: &str,
     chat_id: &str,
-    msg: &FeishuMessage,
+    msg: &ImMessage,
 ) -> Result<(String, Vec<ContentBlock>)> {
     // 先读锁查 session_id
     let existing_sid = state
@@ -440,7 +444,7 @@ async fn prepare_prompt(
             }
             let session_id = sid;
             let text = match &msg.content {
-                MessageContent::Text(t) => t.clone(),
+                ImMessageContent::Text(t) => t.clone(),
                 _ => anyhow::bail!("增量模式仅支持文本消息"),
             };
             let context = format!(
@@ -452,10 +456,10 @@ async fn prepare_prompt(
         None => {
             // 新 session：全量聚合 thread 内容
             tracing::debug!("全量聚合: thread={thread_id}");
-            let submission = state.client.aggregate_thread(thread_id, chat_id).await?;
+            let submission = state.channel.aggregate_topic(thread_id, chat_id).await?;
             tracing::info!(
-                "聚合完成: thread={}, texts={}, images={}, files={}",
-                submission.thread_id,
+                "聚合完成: topic={}, texts={}, images={}, files={}",
+                submission.topic_id,
                 submission.texts.len(),
                 submission.images.len(),
                 submission.files.len(),
@@ -469,7 +473,7 @@ async fn prepare_prompt(
 
             for img in &submission.images {
                 let data = state
-                    .client
+                    .channel
                     .download_resource(&img.message_id, &img.image_key, "image")
                     .await?;
                 let mime = detect_image_mime(&data);
@@ -486,7 +490,7 @@ async fn prepare_prompt(
                 let path = state
                     .resource_store
                     .save_resource(
-                        &state.client,
+                        state.channel.as_ref(),
                         &file.message_id,
                         &file.file_key,
                         "file",
@@ -595,7 +599,7 @@ async fn do_stream_prepared(
                 None => true,
             };
             if should_send {
-                let client = state.client.clone();
+                let channel = state.channel.clone();
                 let msg_id = card_message_id.to_string();
                 let trimmed = full_text.trim_start_matches('\n');
                 let text_snapshot = if in_tool_call {
@@ -605,7 +609,7 @@ async fn do_stream_prepared(
                 };
                 inflight = Some(tokio::spawn(async move {
                     let t = Instant::now();
-                    if let Err(e) = client.update_card(&msg_id, &text_snapshot).await {
+                    if let Err(e) = channel.update_card(&msg_id, &text_snapshot).await {
                         tracing::warn!("更新卡片失败（将继续）: {e}");
                     }
                     tracing::debug!("卡片更新耗时: {}ms", t.elapsed().as_millis());
@@ -629,7 +633,11 @@ async fn do_stream_prepared(
         } else {
             full_text.trim_start_matches('\n').to_string()
         };
-        if let Err(e) = state.client.update_card(card_message_id, &final_text).await {
+        if let Err(e) = state
+            .channel
+            .update_card(card_message_id, &final_text)
+            .await
+        {
             tracing::error!("最终更新卡片失败: {e}");
         }
     }
@@ -664,31 +672,31 @@ async fn shutdown_signal() {
 }
 
 /// 生成消息内容的简短摘要（用于日志）
-fn format_summary(content: &MessageContent) -> String {
+fn format_summary(content: &ImMessageContent) -> String {
     match content {
-        MessageContent::Text(t) => format!("文本: {t}"),
-        MessageContent::Image { image_key } => format!("图片: {image_key}"),
-        MessageContent::File {
+        ImMessageContent::Text(t) => format!("文本: {t}"),
+        ImMessageContent::Image { image_key } => format!("图片: {image_key}"),
+        ImMessageContent::File {
             file_name,
             file_size,
             ..
         } => format!("文件: {file_name} ({file_size} bytes)"),
-        MessageContent::Audio { duration_ms, .. } => format!("音频: {duration_ms}ms"),
-        MessageContent::Media {
+        ImMessageContent::Audio { duration_ms, .. } => format!("音频: {duration_ms}ms"),
+        ImMessageContent::Media {
             file_name,
             duration_ms,
             ..
         } => format!("视频: {file_name} ({duration_ms}ms)"),
-        MessageContent::Sticker { file_type, .. } => format!("表情: {file_type}"),
-        MessageContent::Unsupported { message_type, .. } => {
+        ImMessageContent::Sticker { file_type, .. } => format!("表情: {file_type}"),
+        ImMessageContent::Unsupported { message_type, .. } => {
             format!("未支持类型: {message_type}")
         }
     }
 }
 
 /// 判断消息是否为文本类型
-fn is_text_message(msg: &FeishuMessage) -> bool {
-    matches!(&msg.content, MessageContent::Text(_))
+fn is_text_message(msg: &ImMessage) -> bool {
+    matches!(&msg.content, ImMessageContent::Text(_))
 }
 
 /// 通过文件头魔数检测图片 MIME 类型
@@ -729,18 +737,18 @@ fn mime_from_filename(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feishu::{FeishuMessage, MessageContent};
+    use crate::im::{ImMessage, ImMessageContent};
 
-    /// 构造一条最简 FeishuMessage 用于测试
-    fn make_msg(content: MessageContent) -> FeishuMessage {
-        FeishuMessage {
+    /// 构造一条最简 ImMessage 用于测试
+    fn make_msg(content: ImMessageContent) -> ImMessage {
+        ImMessage {
             message_id: "msg_001".to_string(),
             chat_id: "chat_001".to_string(),
             chat_type: "p2p".to_string(),
-            sender_open_id: "ou_xxx".to_string(),
+            sender_id: "ou_xxx".to_string(),
             content,
             timestamp: 0,
-            root_id: None,
+            topic_id: None,
         }
     }
 
@@ -898,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_text() {
-        let content = MessageContent::Text("你好世界".to_string());
+        let content = ImMessageContent::Text("你好世界".to_string());
         let summary = format_summary(&content);
         assert!(summary.contains("文本"));
         assert!(summary.contains("你好世界"));
@@ -906,7 +914,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_image() {
-        let content = MessageContent::Image {
+        let content = ImMessageContent::Image {
             image_key: "img_key_001".to_string(),
         };
         let summary = format_summary(&content);
@@ -916,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_file() {
-        let content = MessageContent::File {
+        let content = ImMessageContent::File {
             file_key: "fk_001".to_string(),
             file_name: "report.pdf".to_string(),
             file_size: 2048,
@@ -929,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_audio() {
-        let content = MessageContent::Audio {
+        let content = ImMessageContent::Audio {
             file_key: "ak_001".to_string(),
             duration_ms: 5000,
         };
@@ -940,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_media() {
-        let content = MessageContent::Media {
+        let content = ImMessageContent::Media {
             file_key: "vk_001".to_string(),
             file_name: "video.mp4".to_string(),
             duration_ms: 30000,
@@ -955,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_sticker() {
-        let content = MessageContent::Sticker {
+        let content = ImMessageContent::Sticker {
             file_key: "stk_001".to_string(),
             file_type: "png".to_string(),
         };
@@ -966,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_format_summary_unsupported() {
-        let content = MessageContent::Unsupported {
+        let content = ImMessageContent::Unsupported {
             message_type: "location".to_string(),
             raw_content: "{}".to_string(),
         };
@@ -979,13 +987,13 @@ mod tests {
 
     #[test]
     fn test_is_text_message_true() {
-        let msg = make_msg(MessageContent::Text("hello".to_string()));
+        let msg = make_msg(ImMessageContent::Text("hello".to_string()));
         assert!(is_text_message(&msg));
     }
 
     #[test]
     fn test_is_text_message_false_for_image() {
-        let msg = make_msg(MessageContent::Image {
+        let msg = make_msg(ImMessageContent::Image {
             image_key: "k".to_string(),
         });
         assert!(!is_text_message(&msg));
@@ -993,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_is_text_message_false_for_file() {
-        let msg = make_msg(MessageContent::File {
+        let msg = make_msg(ImMessageContent::File {
             file_key: "k".to_string(),
             file_name: "f.pdf".to_string(),
             file_size: 0,
@@ -1003,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_is_text_message_false_for_audio() {
-        let msg = make_msg(MessageContent::Audio {
+        let msg = make_msg(ImMessageContent::Audio {
             file_key: "k".to_string(),
             duration_ms: 0,
         });
@@ -1012,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_is_text_message_false_for_unsupported() {
-        let msg = make_msg(MessageContent::Unsupported {
+        let msg = make_msg(ImMessageContent::Unsupported {
             message_type: "location".to_string(),
             raw_content: "{}".to_string(),
         });

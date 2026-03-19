@@ -230,7 +230,7 @@ pub struct FileItem {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use tokio::sync::mpsc;
 /// use acp_link::feishu::FeishuClient;
 ///
@@ -586,7 +586,9 @@ impl FeishuClient {
         let url = format!(
             "{FEISHU_API_BASE}/im/v1/messages/{message_id}/resources/{file_key}?type={resource_type}"
         );
-        let resp = self.http.clone()
+        let resp = self
+            .http
+            .clone()
             .get(&url)
             .bearer_auth(&token)
             .send()
@@ -619,7 +621,9 @@ impl FeishuClient {
             "reply_in_thread": true,
         });
 
-        let resp: serde_json::Value = self.http.clone()
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -665,7 +669,9 @@ impl FeishuClient {
             "msg_type": "interactive",
         });
 
-        let resp: serde_json::Value = self.http.clone()
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .patch(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -776,7 +782,11 @@ impl FeishuClient {
     ///
     /// 拉取指定 thread 的全部消息，过滤 bot 消息和「确认」关键词，
     /// 按类型分类聚合为 [`ThreadSubmission`]。
-    pub async fn aggregate_thread(&self, thread_id: &str, chat_id: &str) -> anyhow::Result<ThreadSubmission> {
+    pub async fn aggregate_thread(
+        &self,
+        thread_id: &str,
+        chat_id: &str,
+    ) -> anyhow::Result<ThreadSubmission> {
         let chat_id = chat_id.to_string();
 
         let messages = self.get_thread_messages(thread_id).await?;
@@ -864,13 +874,10 @@ impl FeishuClient {
         let form = reqwest::multipart::Form::new()
             .text("image_type", "message")
             .part("image", part);
-        tracing::debug!(
-            file_name,
-            mime,
-            size = image_data.len(),
-            "上传图片到飞书"
-        );
-        let resp: serde_json::Value = self.http.clone()
+        tracing::debug!(file_name, mime, size = image_data.len(), "上传图片到飞书");
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .post(&url)
             .bearer_auth(&token)
             .multipart(form)
@@ -882,7 +889,10 @@ impl FeishuClient {
             .context("解析上传图片响应失败")?;
         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
             tracing::warn!(code, msg, "上传图片失败，飞书返回错误");
             anyhow::bail!("上传图片失败: code={code} msg={msg}");
         }
@@ -899,8 +909,14 @@ impl FeishuClient {
         let form = reqwest::multipart::Form::new()
             .text("file_type", "stream")
             .text("file_name", file_name.to_string())
-            .part("file", reqwest::multipart::Part::bytes(file_data.to_vec()).file_name(file_name.to_string()));
-        let resp: serde_json::Value = self.http.clone()
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(file_data.to_vec())
+                    .file_name(file_name.to_string()),
+            );
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .post(&url)
             .bearer_auth(&token)
             .multipart(form)
@@ -912,7 +928,10 @@ impl FeishuClient {
             .context("解析上传文件响应失败")?;
         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
             anyhow::bail!("上传文件失败: code={code} msg={msg}");
         }
         resp.pointer("/data/file_key")
@@ -931,7 +950,9 @@ impl FeishuClient {
             "msg_type": "image",
             "reply_in_thread": true,
         });
-        let resp: serde_json::Value = self.http.clone()
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -943,7 +964,10 @@ impl FeishuClient {
             .context("解析图片回复响应失败")?;
         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
             anyhow::bail!("发送图片回复失败: code={code} msg={msg}");
         }
         Ok(())
@@ -959,7 +983,9 @@ impl FeishuClient {
             "msg_type": "file",
             "reply_in_thread": true,
         });
-        let resp: serde_json::Value = self.http.clone()
+        let resp: serde_json::Value = self
+            .http
+            .clone()
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -971,7 +997,10 @@ impl FeishuClient {
             .context("解析文件回复响应失败")?;
         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
             anyhow::bail!("发送文件回复失败: code={code} msg={msg}");
         }
         Ok(())
@@ -1315,7 +1344,11 @@ mod tests {
     fn test_parse_file_content_valid() {
         let content = r#"{"file_key": "fk_001", "file_name": "report.pdf", "file_size": 12345}"#;
         match parse_file_content(content) {
-            MessageContent::File { file_key, file_name, file_size } => {
+            MessageContent::File {
+                file_key,
+                file_name,
+                file_size,
+            } => {
                 assert_eq!(file_key, "fk_001");
                 assert_eq!(file_name, "report.pdf");
                 assert_eq!(file_size, 12345);
@@ -1328,7 +1361,11 @@ mod tests {
     fn test_parse_file_content_missing_fields() {
         // 缺字段时应使用默认值
         match parse_file_content("{}") {
-            MessageContent::File { file_key, file_name, file_size } => {
+            MessageContent::File {
+                file_key,
+                file_name,
+                file_size,
+            } => {
                 assert_eq!(file_key, "");
                 assert_eq!(file_name, "");
                 assert_eq!(file_size, 0);
@@ -1343,7 +1380,10 @@ mod tests {
     fn test_parse_audio_content_valid() {
         let content = r#"{"file_key": "audio_001", "duration": 3000}"#;
         match parse_audio_content(content) {
-            MessageContent::Audio { file_key, duration_ms } => {
+            MessageContent::Audio {
+                file_key,
+                duration_ms,
+            } => {
                 assert_eq!(file_key, "audio_001");
                 assert_eq!(duration_ms, 3000);
             }
@@ -1357,7 +1397,13 @@ mod tests {
     fn test_parse_media_content_valid() {
         let content = r#"{"file_key": "vid_001", "file_name": "demo.mp4", "duration": 5000, "width": 1920, "height": 1080}"#;
         match parse_media_content(content) {
-            MessageContent::Media { file_key, file_name, duration_ms, width, height } => {
+            MessageContent::Media {
+                file_key,
+                file_name,
+                duration_ms,
+                width,
+                height,
+            } => {
                 assert_eq!(file_key, "vid_001");
                 assert_eq!(file_name, "demo.mp4");
                 assert_eq!(duration_ms, 5000);
@@ -1374,7 +1420,10 @@ mod tests {
     fn test_parse_sticker_content_valid() {
         let content = r#"{"file_key": "stk_001", "file_type": "png"}"#;
         match parse_sticker_content(content) {
-            MessageContent::Sticker { file_key, file_type } => {
+            MessageContent::Sticker {
+                file_key,
+                file_type,
+            } => {
                 assert_eq!(file_key, "stk_001");
                 assert_eq!(file_type, "png");
             }
@@ -1411,9 +1460,10 @@ mod tests {
             log_id: 0,
             service: 0,
             method: 0,
-            headers: vec![
-                PbHeader { key: "type".into(), value: "ping".into() },
-            ],
+            headers: vec![PbHeader {
+                key: "type".into(),
+                value: "ping".into(),
+            }],
             payload: None,
         };
         assert_eq!(frame.header_value("type"), "ping");
@@ -1442,9 +1492,18 @@ mod tests {
             service: 0,
             method: 1,
             headers: vec![
-                PbHeader { key: "sum".into(), value: "3".into() },
-                PbHeader { key: "seq".into(), value: "1".into() },
-                PbHeader { key: "message_id".into(), value: "msg_abc".into() },
+                PbHeader {
+                    key: "sum".into(),
+                    value: "3".into(),
+                },
+                PbHeader {
+                    key: "seq".into(),
+                    value: "1".into(),
+                },
+                PbHeader {
+                    key: "message_id".into(),
+                    value: "msg_abc".into(),
+                },
             ],
             payload: None,
         };
@@ -1464,9 +1523,10 @@ mod tests {
             log_id: 99,
             service: 1,
             method: 0,
-            headers: vec![
-                PbHeader { key: "type".into(), value: "ping".into() },
-            ],
+            headers: vec![PbHeader {
+                key: "type".into(),
+                value: "ping".into(),
+            }],
             payload: Some(b"hello".to_vec()),
         };
 
@@ -1581,7 +1641,10 @@ mod tests {
             }
         }"#;
         let payload: MsgReceivePayload = serde_json::from_str(json).expect("应成功反序列化");
-        assert_eq!(payload.sender.sender_id.open_id.as_deref(), Some("ou_abc123"));
+        assert_eq!(
+            payload.sender.sender_id.open_id.as_deref(),
+            Some("ou_abc123")
+        );
         assert_eq!(payload.sender.sender_type, "user");
         assert_eq!(payload.message.message_id, "om_001");
         assert_eq!(payload.message.chat_type, "p2p");
@@ -1626,7 +1689,11 @@ mod tests {
         let sum = 3usize;
 
         // 模拟第 0、1、2 片依次到达
-        for (seq_num, chunk) in [(0usize, b"foo".as_ref()), (1, b"bar".as_ref()), (2, b"baz".as_ref())] {
+        for (seq_num, chunk) in [
+            (0usize, b"foo".as_ref()),
+            (1, b"bar".as_ref()),
+            (2, b"baz".as_ref()),
+        ] {
             let entry = frag_cache
                 .entry(msg_id.clone())
                 .or_insert_with(|| (vec![None; sum], Instant::now()));

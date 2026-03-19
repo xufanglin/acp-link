@@ -3,8 +3,6 @@
 //! 以 HTTP 服务形式运行，对外暴露 `/mcp` endpoint，
 //! 实现 MCP Streamable HTTP transport 规范。
 
-pub mod feishu_tools;
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -17,19 +15,19 @@ use axum::routing::{delete, get, post};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
-use crate::feishu::FeishuClient;
+use crate::im::IMChannel;
 
 /// MCP Server 共享状态
 struct McpState {
-    client: FeishuClient,
+    channel: Arc<dyn IMChannel>,
     /// 活跃 session ID（简单实现：仅支持单 session）
     session_id: RwLock<Option<String>>,
 }
 
 /// 启动 MCP HTTP Server（作为后台 task 运行）
-pub async fn start_mcp_server(client: FeishuClient, port: u16) -> Result<()> {
+pub async fn start_mcp_server(channel: Arc<dyn IMChannel>, port: u16) -> Result<()> {
     let state = Arc::new(McpState {
-        client,
+        channel,
         session_id: RwLock::new(None),
     });
 
@@ -92,19 +90,15 @@ async fn handle_post(
         "initialize" => {
             let sid = uuid::Uuid::new_v4().to_string();
             *state.session_id.write().await = Some(sid);
-            handle_initialize(&id)
+            handle_initialize(&id, &state)
         }
-        "tools/list" => handle_tools_list(&id),
-        "tools/call" => handle_tools_call(&id, &params, &state.client).await,
+        "tools/list" => handle_tools_list(&id, &state),
+        "tools/call" => handle_tools_call(&id, &params, &state).await,
         _ => make_error(&id, -32601, &format!("Method not found: {method}")),
     };
 
     let current_sid = state.session_id.read().await.clone();
-    json_response(
-        StatusCode::OK,
-        current_sid.as_deref(),
-        resp,
-    )
+    json_response(StatusCode::OK, current_sid.as_deref(), resp)
 }
 
 /// GET /mcp — SSE stream（当前不需要 server-initiated 消息，返回 405）
@@ -127,7 +121,7 @@ async fn handle_delete(State(state): State<Arc<McpState>>, headers: HeaderMap) -
 
 // ── JSON-RPC handlers ──────────────────────────────────────────
 
-fn handle_initialize(id: &Value) -> Value {
+fn handle_initialize(id: &Value, state: &McpState) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -135,31 +129,31 @@ fn handle_initialize(id: &Value) -> Value {
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
             "serverInfo": {
-                "name": "feishu-mcp",
+                "name": format!("{}-mcp", state.channel.platform_name()),
                 "version": "0.1.0"
             }
         }
     })
 }
 
-fn handle_tools_list(id: &Value) -> Value {
+fn handle_tools_list(id: &Value, state: &McpState) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
-            "tools": feishu_tools::list()
+            "tools": state.channel.mcp_tool_list()
         }
     })
 }
 
-async fn handle_tools_call(id: &Value, params: &Value, client: &FeishuClient) -> Value {
+async fn handle_tools_call(id: &Value, params: &Value, state: &McpState) -> Value {
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    match feishu_tools::call(tool_name, &args, client).await {
+    match state.channel.mcp_tool_call(tool_name, &args).await {
         Ok(data) => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -221,11 +215,23 @@ mod tests {
         assert!(err["id"].is_null());
     }
 
+    // ── test helper ────────────────────────────────────────────────────────
+
+    fn test_state() -> McpState {
+        use crate::im::FeishuChannel;
+        let channel = FeishuChannel::new("test_id", "test_secret");
+        McpState {
+            channel: Arc::new(channel),
+            session_id: RwLock::new(None),
+        }
+    }
+
     // ── handle_initialize ───────────────────────────────────────────────────
 
     #[test]
     fn test_handle_initialize_response() {
-        let resp = handle_initialize(&json!(1));
+        let state = test_state();
+        let resp = handle_initialize(&json!(1), &state);
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         let result = &resp["result"];
@@ -237,7 +243,8 @@ mod tests {
 
     #[test]
     fn test_handle_tools_list_response() {
-        let resp = handle_tools_list(&json!(2));
+        let state = test_state();
+        let resp = handle_tools_list(&json!(2), &state);
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert!(!tools.is_empty());
@@ -251,7 +258,11 @@ mod tests {
         let resp = json_response(StatusCode::OK, Some("sid-123"), json!({"ok": true}));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("mcp-session-id").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "sid-123"
         );
     }

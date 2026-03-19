@@ -1,4 +1,6 @@
 log_level = "debug"
+# IM 平台选择，当前支持: "feishu"，默认 "feishu"
+# im_platform = "feishu"
 # 日志保留天数，默认 7 天
 # log_retention = 7
 # Session 保留天数，默认 7 天

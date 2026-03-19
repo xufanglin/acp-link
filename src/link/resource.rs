@@ -4,8 +4,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::feishu::FeishuClient;
-
+use crate::im::IMChannel;
 
 /// 资源存储：将飞书下载的图片/文件以 SHA256 去重保存到本地目录
 #[derive(Clone)]
@@ -25,26 +24,26 @@ impl ResourceStore {
         }
     }
 
-    /// 从飞书下载资源并存储，返回本地 `file:///` URI
+    /// 从 IM 平台下载资源并存储，返回本地路径
     ///
     /// 文件以 `{sha256}.{ext}` 命名，已存在则跳过下载。
     ///
     /// # Arguments
     ///
-    /// * `client` - 飞书客户端
+    /// * `channel` - IM channel（实现 IMChannel trait）
     /// * `message_id` - 消息 ID
-    /// * `file_key` - 飞书资源 key
+    /// * `file_key` - 资源 key
     /// * `resource_type` - `"file"` 或 `"image"`
     /// * `original_name` - 原始文件名（用于提取扩展名）
     pub async fn save_resource(
         &self,
-        client: &FeishuClient,
+        channel: &dyn IMChannel,
         message_id: &str,
         file_key: &str,
         resource_type: &str,
         original_name: &str,
     ) -> Result<PathBuf> {
-        let data = client
+        let data = channel
             .download_resource(message_id, file_key, resource_type)
             .await
             .with_context(|| format!("下载资源失败: {file_key}"))?;
@@ -85,9 +84,8 @@ impl ResourceStore {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => {
-                return Err(
-                    anyhow::anyhow!(e).context(format!("读取目录失败: {}", self.save_dir.display()))
-                )
+                return Err(anyhow::anyhow!(e)
+                    .context(format!("读取目录失败: {}", self.save_dir.display())));
             }
         };
 

@@ -36,6 +36,10 @@ impl KiroConfig {
     }
 }
 
+fn default_im_platform() -> String {
+    "feishu".to_string()
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -82,6 +86,9 @@ fn default_mcp_port() -> u16 {
 /// 应用全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// 当前使用的 IM 平台（"feishu"）
+    #[serde(default = "default_im_platform")]
+    pub im_platform: String,
     /// 日志级别，例如 "info", "debug", "warn"
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -152,6 +159,14 @@ args = ["acp", "--agent", "lark"]
             .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
         let config: Self = toml::from_str(&content)
             .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
+        const SUPPORTED_PLATFORMS: &[&str] = &["feishu"];
+        if !SUPPORTED_PLATFORMS.contains(&config.im_platform.as_str()) {
+            anyhow::bail!(
+                "不支持的 IM 平台: \"{}\"，当前支持: {:?}",
+                config.im_platform,
+                SUPPORTED_PLATFORMS
+            );
+        }
         config.ensure_dirs()?;
         Ok(config)
     }

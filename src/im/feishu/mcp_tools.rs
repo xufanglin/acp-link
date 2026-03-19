@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::feishu::FeishuClient;
+use super::client::FeishuClient;
 
 /// 返回飞书相关 tools 的 schema 列表
 pub fn list() -> Vec<Value> {
@@ -56,7 +56,9 @@ async fn send_file(args: &Value, client: &FeishuClient) -> Result<Value, String>
     );
 
     if file_path.is_empty() || message_id.is_empty() {
-        tracing::warn!("feishu_send_file 参数缺失: file_path={file_path:?}, message_id={message_id:?}");
+        tracing::warn!(
+            "feishu_send_file 参数缺失: file_path={file_path:?}, message_id={message_id:?}"
+        );
         return Err("file_path and message_id are required".into());
     }
 
@@ -64,7 +66,11 @@ async fn send_file(args: &Value, client: &FeishuClient) -> Result<Value, String>
         tracing::error!("feishu_send_file 读取文件失败: {file_path} -> {e}");
         format!("读取文件失败: {e}")
     })?;
-    tracing::debug!("feishu_send_file 文件已读取: {} bytes, is_image={}", data.len(), is_image_file(file_path));
+    tracing::debug!(
+        "feishu_send_file 文件已读取: {} bytes, is_image={}",
+        data.len(),
+        is_image_file(file_path)
+    );
 
     if is_image_file(file_path) {
         let image_key = client.upload_image(&file_name, &data).await.map_err(|e| {
@@ -76,29 +82,36 @@ async fn send_file(args: &Value, client: &FeishuClient) -> Result<Value, String>
             .send_image_reply(message_id, &image_key)
             .await
             .map_err(|e| {
-                tracing::error!("feishu_send_file 发送图片回复失败: message_id={message_id}, {e:#}");
+                tracing::error!(
+                    "feishu_send_file 发送图片回复失败: message_id={message_id}, {e:#}"
+                );
                 format!("{e:#}")
             })?;
-        tracing::info!("feishu_send_file 图片发送成功: message_id={message_id}, image_key={image_key}");
+        tracing::info!(
+            "feishu_send_file 图片发送成功: message_id={message_id}, image_key={image_key}"
+        );
         Ok(json!({ "status": "sent", "type": "image", "image_key": image_key }))
     } else {
-        let file_key = client
-            .upload_file(&file_name, &data)
-            .await
-            .map_err(|e| {
-                tracing::error!("feishu_send_file 上传文件失败: {e:#}");
-                format!("{e:#}")
-            })?;
+        let file_key = client.upload_file(&file_name, &data).await.map_err(|e| {
+            tracing::error!("feishu_send_file 上传文件失败: {e:#}");
+            format!("{e:#}")
+        })?;
         tracing::debug!("feishu_send_file 文件已上传: file_key={file_key}");
         client
             .send_file_reply(message_id, &file_key)
             .await
             .map_err(|e| {
-                tracing::error!("feishu_send_file 发送文件回复失败: message_id={message_id}, {e:#}");
+                tracing::error!(
+                    "feishu_send_file 发送文件回复失败: message_id={message_id}, {e:#}"
+                );
                 format!("{e:#}")
             })?;
-        tracing::info!("feishu_send_file 文件发送成功: message_id={message_id}, file_key={file_key}, file_name={file_name}");
-        Ok(json!({ "status": "sent", "type": "file", "file_key": file_key, "file_name": file_name }))
+        tracing::info!(
+            "feishu_send_file 文件发送成功: message_id={message_id}, file_key={file_key}, file_name={file_name}"
+        );
+        Ok(
+            json!({ "status": "sent", "type": "file", "file_key": file_key, "file_name": file_name }),
+        )
     }
 }
 
@@ -185,7 +198,13 @@ mod tests {
         let tools = list();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "feishu_send_file");
-        assert!(tools[0]["inputSchema"]["required"].as_array().unwrap().len() >= 2);
+        assert!(
+            tools[0]["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 2
+        );
     }
 
     // ── call 未知工具 ──────────────────────────────────────────────────────

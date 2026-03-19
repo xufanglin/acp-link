@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-`acp.rs` 实现了 acp-link 与 kiro-cli 之间的通信桥接。核心挑战在于：ACP SDK（`agent-client-protocol`）使用了 `!Send` 的 future，无法在 tokio 的多线程调度器上直接使用。为此，桥接层采用**进程池 + 专用线程**架构，将 `!Send` 约束隔离在独立线程内，同时对外暴露线程安全的异步接口。worker 崩溃时支持自动重启。
+`link/acp.rs` 实现了 acp-link 与 kiro-cli 之间的通信桥接。核心挑战在于：ACP SDK（`agent-client-protocol`）使用了 `!Send` 的 future，无法在 tokio 的多线程调度器上直接使用。为此，桥接层采用**进程池 + 专用线程**架构，将 `!Send` 约束隔离在独立线程内，同时对外暴露线程安全的异步接口。worker 崩溃时支持自动重启。
 
 ---
 
@@ -53,7 +53,7 @@ let (conn, io_task) = ClientSideConnection::new(
 ### 3.1 设计目标
 
 - **并行**：多个用户的对话可以并行进入不同 kiro-cli 进程处理。
-- **串行一致性**：同一个飞书 Thread 的消息必须串行进入同一个 kiro-cli 进程，保证 ACP session 上下文连续。
+- **串行一致性**：同一个 Topic（飞书 Thread 等）的消息必须串行进入同一个 kiro-cli 进程，保证 ACP session 上下文连续。
 - **容错**：worker 崩溃时自动重启，对调用方透明。
 
 ### 3.2 Worker 结构
@@ -90,14 +90,14 @@ fn route_idx(&self, routing_key: &str) -> usize {
 }
 ```
 
-使用 FNV-1a 64 位哈希而非 `DefaultHasher`，确保**跨 Rust 版本和进程重启结果完全一致**。`routing_key` 为飞书 `thread_id`，对同一 thread 的所有请求始终路由到同一个 worker。
+使用 FNV-1a 64 位哈希而非 `DefaultHasher`，确保**跨 Rust 版本和进程重启结果完全一致**。`routing_key` 为 `topic_id`（对应飞书 `thread_id` 等平台概念），对同一 topic 的所有请求始终路由到同一个 worker。
 
 ```mermaid
 graph LR
-    T1["thread_id=A\nhash→worker-1"]
-    T2["thread_id=B\nhash→worker-0"]
-    T3["thread_id=C\nhash→worker-1"]
-    T4["thread_id=D\nhash→worker-3"]
+    T1["topic_id=A\nhash→worker-1"]
+    T2["topic_id=B\nhash→worker-0"]
+    T3["topic_id=C\nhash→worker-1"]
+    T4["topic_id=D\nhash→worker-3"]
 
     W0["worker-0\nkiro-cli"]
     W1["worker-1\nkiro-cli"]
@@ -109,7 +109,7 @@ graph LR
     T4 --> W3
 ```
 
-注意：worker-1 会串行处理 thread A 和 thread C 的请求（队列深度为 32）。
+注意：worker-1 会串行处理 topic A 和 topic C 的请求（队列深度为 32）。
 
 ---
 
@@ -191,11 +191,11 @@ fn select_permission_option(options: &[PermissionOption]) -> Option<PermissionOp
 
 `AcpBridge` 提供三个静态辅助方法，供 `link.rs` 构建 prompt 内容：
 
-| 方法 | 对应消息类型 | 说明 |
-|------|------------|------|
-| `text_block(text)` | 文本 | 直接包装为 `ContentBlock::Text` |
-| `image_block(data, mime)` | 图片 | base64 编码内嵌为 `ContentBlock::Image` |
-| `resource_link_block(name, uri, mime)` | 文件 | `file:///` URI，`ContentBlock::ResourceLink` |
+| 方法                                   | 对应消息类型 | 说明                                         |
+| -------------------------------------- | ------------ | -------------------------------------------- |
+| `text_block(text)`                     | 文本         | 直接包装为 `ContentBlock::Text`              |
+| `image_block(data, mime)`              | 图片         | base64 编码内嵌为 `ContentBlock::Image`      |
+| `resource_link_block(name, uri, mime)` | 文件         | `file:///` URI，`ContentBlock::ResourceLink` |
 
 图片使用内嵌（inline）方式，无需 agent 额外下载；文件使用 `file://` URI 让 agent 按需读取本地文件。
 
@@ -292,11 +292,11 @@ sequenceDiagram
 
 ## 10. 错误处理
 
-| 场景 | 处理方式 |
-|------|---------|
-| worker 线程退出（kiro-cli 崩溃） | `send_cmd` 检测到 send 失败，自动重启 worker 并重试一次 |
-| ACP 初始化失败 | `ready_tx` 发送错误，`AcpBridge::start` 返回 `Err`，服务启动失败 |
-| ACP 初始化超时 | `tokio::time::timeout(10s)` 触发，`AcpBridge::start` 返回 `Err` |
-| Prompt 失败（ACP 层） | 记录 `tracing::error`，chunk_tx drop，主线程 rx 关闭，最终卡片显示已收到的部分内容 |
-| 权限请求无选项 | 返回 `internal_error`，触发 prompt 失败流程 |
-| Worker 重启后仍失败 | 返回 `Err` 给调用方，`link.rs` 更新卡片为错误信息 |
+| 场景                             | 处理方式                                                                           |
+| -------------------------------- | ---------------------------------------------------------------------------------- |
+| worker 线程退出（kiro-cli 崩溃） | `send_cmd` 检测到 send 失败，自动重启 worker 并重试一次                            |
+| ACP 初始化失败                   | `ready_tx` 发送错误，`AcpBridge::start` 返回 `Err`，服务启动失败                   |
+| ACP 初始化超时                   | `tokio::time::timeout(10s)` 触发，`AcpBridge::start` 返回 `Err`                    |
+| Prompt 失败（ACP 层）            | 记录 `tracing::error`，chunk_tx drop，主线程 rx 关闭，最终卡片显示已收到的部分内容 |
+| 权限请求无选项                   | 返回 `internal_error`，触发 prompt 失败流程                                        |
+| Worker 重启后仍失败              | 返回 `Err` 给调用方，`link.rs` 更新卡片为错误信息                                  |
