@@ -1,7 +1,16 @@
-//! 飞书平台的 IMChannel 实现
+//! 飞书平台的 [`IMChannel`](crate::im::IMChannel) 实现
 //!
-//! 将 `FeishuClient` 封装为 `FeishuChannel`，实现 `IMChannel` trait，
-//! 各方法直接委托给内部 client。
+//! 将 `FeishuClient` 封装为 [`FeishuChannel`]，实现 `IMChannel` trait。
+//! 各方法直接委托给内部 client，同时负责飞书特有类型
+//! （`FeishuMessage` / `MessageContent` / `ThreadSubmission`）
+//! 与跨平台统一类型（`ImMessage` / `ImMessageContent` / `TopicSubmission`）之间的转换。
+//!
+//! ## 消息监听
+//!
+//! `listen()` 内部创建一个转发 task：
+//! 1. 调用 `FeishuClient::listen()` 接收 `FeishuMessage`
+//! 2. 通过 `convert_message()` 转换为 `ImMessage`
+//! 3. 发送到上层提供的 `mpsc::Sender<ImMessage>`
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -159,6 +168,7 @@ fn convert_content(content: MessageContent) -> ImMessageContent {
             file_key,
             file_type,
         },
+        MessageContent::Link { url } => ImMessageContent::Link { url },
         MessageContent::Unsupported {
             message_type,
             raw_content,

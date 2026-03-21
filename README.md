@@ -1,26 +1,28 @@
 # acp-link
 
-IM ↔ ACP (Agent Client Protocol) 桥接服务，使用 Rust 编写。
+IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [Kiro](https://kiro.dev/) Agent 对话。
 
-通过 `IMChannel` trait 抽象层监听 IM 平台消息，通过 ACP 协议将内容转发给 kiro-cli agent，并将 agent 的流式响应以富文本消息形式实时回复到 IM。当前支持飞书（Feishu）平台，架构设计支持扩展到钉钉、Slack 等其他 IM。
+通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给 kiro-cli agent，agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
 ## 功能特性
 
-- **IM 平台抽象** — 通过 `IMChannel` trait 支持多 IM 平台，当前内置飞书
-- **多媒体消息支持** — 文本、图片、文件、音频、视频、表情包
-- **Topic 话题聚合** — 首条消息聚合整个 topic 上下文，后续消息增量追加
-- **消息流式更新** — 流式展示 agent 响应
-- **内嵌 MCP Server** — 暴露 IM 平台工具（如文件发送）供 agent 调用
-- **Session 持久化** — 自动过期清理，支持断点续聊
+- 多媒体消息支持 — 文本、图片、文件、音频、视频、表情包
+- Topic 话题聚合 — 首条消息聚合整个 topic 上下文，后续消息增量追加
+- 消息流式更新 — 实时展示 agent 响应，无需等待完整回复
+- 内嵌 MCP Server — 暴露 IM 平台工具（如文件发送）供 agent 反向调用
+- Session 持久化 — 自动过期清理，支持断点续聊
 
 ## 前置要求
 
 - [kiro-cli](https://kiro.dev/)（需支持 `kiro-cli acp` 模式）
 - 飞书自建应用，需开通以下权限：
-  - `im:message:receive_v1`（接收消息事件）
-  - `im:message`（发送/更新消息）
-  - `im:message.p2p_msg`（私聊消息）
-  - `im:resource`（下载图片/文件资源）
+  - `im:message` — 获取与发送消息
+  - `im:message.p2p_msg` — 读取私聊消息
+  - `im:message.group_msg` — 读取群聊消息
+  - `im:resource` — 获取消息中的资源文件
+  - `im:chat` — 获取群信息（话题消息列表）
+  - `docx:document:readonly` — 读取云文档内容（`feishu_get_document` 工具需要）
+  - 事件订阅：`im.message.receive_v1`（接收消息回调）
 
 ## 安装
 
@@ -48,6 +50,7 @@ app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 pool_size = 4          # 进程池大小，按 topic_id hash 路由
+# cwd = "/path/to/project"  # Agent 工作目录（默认 ~/.acp-link/temp/）
 
 [mcp]
 port = 9800            # MCP HTTP Server 监听端口（默认 9800）
@@ -139,14 +142,6 @@ systemctl --user stop acp-link.service
 systemctl --user restart acp-link.service
 ```
 
-## 技术文档
-
-详细的系统架构、模块设计、协议细节等请参阅 [docs/](docs/) 目录：
-
-- [architecture.md](docs/architecture.md) — 系统架构与模块划分
-- [acp-bridge.md](docs/acp-bridge.md) — ACP 桥接层设计
-- [feishu-protocol.md](docs/feishu-protocol.md) — 飞书 WS 协议细节
-
 ## kiro-cli Agent 配置
 
 要让 kiro-cli 能通过 MCP 协议调用飞书工具（如 `feishu_send_file` 回传文件），需要创建自定义 agent 配置。
@@ -208,99 +203,34 @@ args = ["acp", "--agent", "lark"]
 
 如需添加其他 MCP Server（如 `markitdown-mcp` 用于文档转换），可在 `mcpServers` 中追加配置。
 
-## MCP Server
+## MCP 工具
 
-服务启动时会同时在本地启动 MCP HTTP Server（默认端口 `9800`），暴露 IM 平台相关工具。当前飞书平台提供以下工具：
+服务启动时会同时在本地启动 MCP HTTP Server（默认端口 `9800`），暴露 IM 平台相关工具供 agent 调用：
 
-| 工具名             | 说明                                                      |
-| ------------------ | --------------------------------------------------------- |
-| `feishu_send_file` | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件） |
+| 工具名                | 说明                                                      |
+| --------------------- | --------------------------------------------------------- |
+| `feishu_send_file`    | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件） |
+| `feishu_get_document` | 获取飞书云文档纯文本内容（支持 URL 或裸 document_id）     |
 
-kiro-cli agent 可通过 MCP 协议调用这些工具。Tool 列表由 `IMChannel::mcp_tool_list()` 动态提供，不同 IM 平台可注册不同的工具集。
+## 目录结构
 
-## 扩展 IM 平台
-
-acp-link 通过 `IMChannel` trait 抽象 IM 平台差异。要接入新的 IM 平台（如钉钉、Slack），需要以下步骤：
-
-### 1. 实现 `IMChannel` trait
-
-在 `src/im/` 下创建新模块目录（如 `src/im/dingtalk/`），实现 `IMChannel` trait 的所有方法：
-
-```rust
-use async_trait::async_trait;
-use crate::im::{IMChannel, ImMessage, TopicSubmission};
-use tokio::sync::mpsc;
-
-pub struct DingtalkChannel { /* ... */ }
-
-#[async_trait]
-impl IMChannel for DingtalkChannel {
-    fn platform_name(&self) -> &str { "dingtalk" }
-
-    async fn listen(&self, tx: mpsc::Sender<ImMessage>) -> anyhow::Result<()> {
-        // 连接钉钉消息源，将收到的消息转换为 ImMessage 发送到 tx
-        todo!()
-    }
-
-    async fn reply_message(&self, message_id: &str, markdown: &str) -> anyhow::Result<(String, String)> {
-        // 回复富文本消息，返回 (new_message_id, topic_id)
-        todo!()
-    }
-
-    // ... 实现其余方法（update_message, download_resource, aggregate_topic 等）
-    // ... 以及 mcp_tool_list / mcp_tool_call 注册平台专属 MCP 工具
-}
+```
+~/.acp-link/
+├── config.toml       # 配置文件
+├── sessions.json     # Session 映射（自动管理）
+├── data/             # 资源文件（SHA256 去重）
+├── temp/             # Agent 工作目录
+└── logs/             # 滚动日志
 ```
 
-关键方法说明：
+## 技术文档
 
-- `listen` — 持续监听消息源，将平台消息转换为统一的 `ImMessage`
-- `reply_message` / `update_message` — 富文本消息的创建与流式更新（各平台自行决定渲染方式）
-- `aggregate_topic` — 聚合 topic 内所有用户消息（用于首次全量上下文构建）
-- `mcp_tool_list` / `mcp_tool_call` — 注册和执行平台专属的 MCP 工具
+详细的系统架构、模块设计、协议细节等请参阅 [docs/](docs/) 目录：
 
-### 2. 注册模块
-
-在 `src/im.rs` 中添加模块声明和 re-export：
-
-```rust
-mod dingtalk;
-pub use self::dingtalk::DingtalkChannel;
-```
-
-同时创建 `src/im/dingtalk.rs` 作为 facade 模块入口（参考 `src/im/feishu.rs`），在 `src/im/dingtalk/` 目录下实现具体逻辑。
-
-### 3. 添加配置
-
-在 `config.rs` 中：
-
-- 添加平台配置结构体（如 `DingtalkConfig`）
-- 在 `AppConfig` 中添加对应字段
-- 在 `SUPPORTED_PLATFORMS` 数组中加入 `"dingtalk"`
-
-### 4. 注册到 main.rs
-
-在 `main.rs` 的 platform match 中添加分支：
-
-```rust
-let channel: Arc<dyn IMChannel> = match config.im_platform.as_str() {
-    "feishu" => Arc::new(FeishuChannel::new(...)),
-    "dingtalk" => Arc::new(DingtalkChannel::new(...)),
-    _ => anyhow::bail!("不支持的 IM 平台: {}", config.im_platform),
-};
-```
-
-### 5. 配置文件
-
-在 `config.toml` 中设置 `im_platform` 并添加平台配置段：
-
-```toml
-im_platform = "dingtalk"
-
-[dingtalk]
-app_key = "your_app_key"
-app_secret = "your_app_secret"
-```
+- [architecture.md](docs/architecture.md) — 系统架构与模块划分
+- [acp-bridge.md](docs/acp-bridge.md) — ACP 桥接层设计
+- [feishu-protocol.md](docs/feishu-protocol.md) — 飞书 WS 协议细节
+- [extending-im-platform.md](docs/extending-im-platform.md) — 扩展新的 IM 平台
 
 ## License
 

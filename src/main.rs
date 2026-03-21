@@ -2,7 +2,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-/// 入口：加载配置 → 初始化日志 → 启动 LinkService（含内嵌 MCP Server）
+/// 入口：加载配置 → 初始化滚动日志 → 根据 `im_platform` 创建 IM channel → 启动 LinkService
+///
+/// LinkService 内部会启动：
+/// - IM 消息监听循环（WS 长连接，断开自动重连）
+/// - ACP 进程池（kiro-cli 子进程，`!Send` 隔离）
+/// - 内嵌 MCP HTTP Server（供 agent 反向调用 IM 能力）
+/// - 定时清理任务（session / 资源 / 日志）
+/// - 优雅关机处理（SIGTERM / Ctrl+C）
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("acp-link v0.2.4");

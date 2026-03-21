@@ -1,3 +1,21 @@
+//! 核心服务模块
+//!
+//! [`LinkService`] 是 acp-link 的主服务，负责：
+//!
+//! - 监听 IM 消息（通过 `IMChannel::listen()`，WS 断开自动重连）
+//! - 每条消息 spawn 独立 task 并发处理
+//! - 管理 session 生命周期（全量模式 / 增量模式）
+//! - 构建 ACP prompt content blocks（文本 / 图片 / 文件）
+//! - 流式消费 agent 响应并节流更新 IM 消息（300ms 间隔）
+//! - 定时清理过期 session、资源文件、临时目录和历史日志
+//! - 优雅关机（SIGTERM / Ctrl+C → flush session 映射）
+//!
+//! ## 子模块
+//!
+//! - [`acp`] — ACP 桥接（kiro-cli 进程池、`!Send` 隔离、流式 chunk 转发）
+//! - [`session`] — Session 映射持久化（topic_id ↔ session_id）
+//! - [`resource`] — 资源文件存储（SHA256 去重、过期清理）
+
 mod acp;
 mod resource;
 mod session;
@@ -243,11 +261,11 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
         msg.message_id
     );
 
-    let is_text = is_text_message(&msg);
+    let is_actionable = is_actionable_message(&msg);
 
     match &msg.topic_id {
         None => {
-            let hint = if is_text {
+            let hint = if is_actionable {
                 "..."
             } else {
                 "收到，请继续输入指令"
@@ -262,7 +280,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                     {
                         tracing::error!("持久化 thread 映射失败: {e}");
                     }
-                    if is_text {
+                    if is_actionable {
                         stream_acp_reply(&state, &thread_id, &msg.chat_id, &reply_msg_id, &msg)
                             .await;
                     }
@@ -279,7 +297,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                 .map(str::to_owned);
             match thread_id {
                 Some(thread_id) => {
-                    if is_text {
+                    if is_actionable {
                         submit_to_acp_streaming(
                             &state,
                             &thread_id,
@@ -300,7 +318,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                 }
                 None => {
                     tracing::debug!("[{}] root_id={root_id} 无映射，作为新会话处理", msg.chat_id);
-                    let hint = if is_text {
+                    let hint = if is_actionable {
                         "..."
                     } else {
                         "收到，请继续输入指令"
@@ -315,7 +333,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                             {
                                 tracing::error!("持久化 thread 映射失败: {e}");
                             }
-                            if is_text {
+                            if is_actionable {
                                 stream_acp_reply(
                                     &state,
                                     &thread_id,
@@ -687,6 +705,7 @@ fn format_summary(content: &ImMessageContent) -> String {
             ..
         } => format!("视频: {file_name} ({duration_ms}ms)"),
         ImMessageContent::Sticker { file_type, .. } => format!("表情: {file_type}"),
+        ImMessageContent::Link { url } => format!("链接: {url}"),
         ImMessageContent::Unsupported { message_type, .. } => {
             format!("未支持类型: {message_type}")
         }
@@ -694,7 +713,8 @@ fn format_summary(content: &ImMessageContent) -> String {
 }
 
 /// 判断消息是否为文本类型
-fn is_text_message(msg: &ImMessage) -> bool {
+/// 判断消息是否为可执行指令（纯文本），Link 等素材类型不算
+fn is_actionable_message(msg: &ImMessage) -> bool {
     matches!(&msg.content, ImMessageContent::Text(_))
 }
 
@@ -982,47 +1002,47 @@ mod tests {
         assert!(summary.contains("location"));
     }
 
-    // ── is_text_message ──────────────────────────────────────────────────────
+    // ── is_actionable_message ──────────────────────────────────────────────
 
     #[test]
-    fn test_is_text_message_true() {
+    fn test_is_actionable_message_true() {
         let msg = make_msg(ImMessageContent::Text("hello".to_string()));
-        assert!(is_text_message(&msg));
+        assert!(is_actionable_message(&msg));
     }
 
     #[test]
-    fn test_is_text_message_false_for_image() {
+    fn test_is_actionable_message_false_for_image() {
         let msg = make_msg(ImMessageContent::Image {
             image_key: "k".to_string(),
         });
-        assert!(!is_text_message(&msg));
+        assert!(!is_actionable_message(&msg));
     }
 
     #[test]
-    fn test_is_text_message_false_for_file() {
+    fn test_is_actionable_message_false_for_file() {
         let msg = make_msg(ImMessageContent::File {
             file_key: "k".to_string(),
             file_name: "f.pdf".to_string(),
             file_size: 0,
         });
-        assert!(!is_text_message(&msg));
+        assert!(!is_actionable_message(&msg));
     }
 
     #[test]
-    fn test_is_text_message_false_for_audio() {
+    fn test_is_actionable_message_false_for_audio() {
         let msg = make_msg(ImMessageContent::Audio {
             file_key: "k".to_string(),
             duration_ms: 0,
         });
-        assert!(!is_text_message(&msg));
+        assert!(!is_actionable_message(&msg));
     }
 
     #[test]
-    fn test_is_text_message_false_for_unsupported() {
+    fn test_is_actionable_message_false_for_unsupported() {
         let msg = make_msg(ImMessageContent::Unsupported {
             message_type: "location".to_string(),
             raw_content: "{}".to_string(),
         });
-        assert!(!is_text_message(&msg));
+        assert!(!is_actionable_message(&msg));
     }
 }

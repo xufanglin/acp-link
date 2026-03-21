@@ -175,6 +175,8 @@ pub enum MessageContent {
     },
     /// 表情包
     Sticker { file_key: String, file_type: String },
+    /// 链接素材（如飞书云文档 URL）
+    Link { url: String },
     /// 暂不支持的类型，保留原始 content 供上层处理
     Unsupported {
         message_type: String,
@@ -479,7 +481,11 @@ impl FeishuClient {
                                 let t = strip_at_placeholders(&t);
                                 let t = t.trim().to_string();
                                 if t.is_empty() { continue; }
-                                MessageContent::Text(t)
+                                if is_feishu_link(&t) {
+                                    MessageContent::Link { url: t }
+                                } else {
+                                    MessageContent::Text(t)
+                                }
                             }
                             None => continue,
                         },
@@ -1207,6 +1213,17 @@ fn parse_text_content(content: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// 判断文本是否为纯飞书链接（feishu.cn / larksuite.com）
+///
+/// 仅当整段文本 trim 后是单个飞书 URL 时返回 true，
+/// 混合了其他文字的不算。
+fn is_feishu_link(text: &str) -> bool {
+    let t = text.trim();
+    (t.contains(".feishu.cn/") || t.contains(".larksuite.com/"))
+        && t.starts_with("https://")
+        && !t.contains(char::is_whitespace)
 }
 
 /// 根据文件扩展名推断 MIME type

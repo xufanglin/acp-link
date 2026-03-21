@@ -1,7 +1,19 @@
 //! IM 抽象层 facade 模块
 //!
-//! 定义跨平台统一的消息类型和 `IMChannel` trait，
+//! 定义跨平台统一的消息类型和 [`IMChannel`] trait，
 //! 通过 `pub use` 重新导出所有公开类型。
+//!
+//! ## 设计思路
+//!
+//! 所有 IM 平台（飞书、钉钉、Slack 等）通过实现 [`IMChannel`] trait 接入，
+//! 上层模块（`link.rs`、`mcp.rs`）仅依赖 trait 接口，不感知具体平台实现。
+//!
+//! 消息类型使用 [`ImMessage`] + [`ImMessageContent`] 统一表示，
+//! 各平台在 channel 实现中负责将平台特有格式转换为统一类型。
+//!
+//! ## 当前实现
+//!
+//! - [`FeishuChannel`] — 飞书平台（WS 长连接 + REST API）
 
 mod feishu;
 pub use self::feishu::FeishuChannel;
@@ -53,6 +65,8 @@ pub enum ImMessageContent {
     },
     /// 表情包
     Sticker { file_key: String, file_type: String },
+    /// 链接素材（如飞书云文档 URL）
+    Link { url: String },
     /// 暂不支持的类型
     Unsupported {
         message_type: String,

@@ -1,7 +1,25 @@
 //! MCP Server (Streamable HTTP)
 //!
 //! 以 HTTP 服务形式运行，对外暴露 `/mcp` endpoint，
-//! 实现 MCP Streamable HTTP transport 规范。
+//! 实现 MCP Streamable HTTP transport 规范（JSON-RPC 2.0）。
+//!
+//! ## 支持的 method
+//!
+//! - `initialize` — 创建 session，返回 server capabilities 和 session ID
+//! - `tools/list` — 列出可用工具（由 `IMChannel::mcp_tool_list()` 动态提供）
+//! - `tools/call` — 执行工具调用（由 `IMChannel::mcp_tool_call()` 分发）
+//!
+//! ## Session 管理
+//!
+//! - `POST /mcp` 的 `initialize` 请求生成 UUID v4 作为 session ID
+//! - 后续请求需在 `Mcp-Session-Id` header 中携带
+//! - `DELETE /mcp` 终止 session
+//! - 当前为简单实现，仅支持单 session
+//!
+//! ## 架构
+//!
+//! MCP Server 通过 `Arc<dyn IMChannel>` 调用 IM 平台能力，
+//! 与具体 IM 平台解耦。不同平台可注册不同的工具集。
 
 use std::sync::Arc;
 

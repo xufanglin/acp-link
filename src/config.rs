@@ -1,3 +1,24 @@
+//! 配置管理模块
+//!
+//! 负责 TOML 配置文件的解析、校验和目录管理。
+//!
+//! ## 配置查找优先级
+//!
+//! 1. 环境变量 `ACP_LINK_CONFIG` 指定的路径
+//! 2. 当前工作目录下的 `config.toml`
+//! 3. `~/.acp-link/config.toml`（不存在时自动生成默认模板）
+//!
+//! ## 目录结构
+//!
+//! ```text
+//! ~/.acp-link/
+//! ├── config.toml       # 全局配置
+//! ├── sessions.json     # Session 映射（自动管理）
+//! ├── data/             # 资源文件（SHA256 去重）
+//! ├── temp/             # kiro-cli 工作目录
+//! └── logs/             # 滚动日志
+//! ```
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

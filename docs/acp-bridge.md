@@ -71,16 +71,16 @@ AcpBridge
                                                            ...
 ```
 
-pool_size 由配置文件的 `kiro.pool_size` 控制，默认为 4。每个 worker 的 sender 包裹在 `Arc<Mutex>` 中，崩溃重启时可原子替换。
+`pool_size` 由配置文件的 `kiro.pool_size` 控制，默认为 4。每个 worker 的 sender 包裹在 `Arc<Mutex>` 中，崩溃重启时可原子替换。
 
 ### 3.3 FNV-1a 稳定 hash 路由
 
 ```rust
 fn stable_hash(s: &str) -> u64 {
-    let mut hash: u64 = 14695981039346656037;
+    let mut hash: u64 = 14695981039346656037;  // FNV offset basis
     for b in s.bytes() {
         hash ^= b as u64;
-        hash = hash.wrapping_mul(1099511628211);
+        hash = hash.wrapping_mul(1099511628211);  // FNV prime
     }
     hash
 }
@@ -94,14 +94,14 @@ fn route_idx(&self, routing_key: &str) -> usize {
 
 ```mermaid
 graph LR
-    T1["topic_id=A\nhash→worker-1"]
-    T2["topic_id=B\nhash→worker-0"]
-    T3["topic_id=C\nhash→worker-1"]
-    T4["topic_id=D\nhash→worker-3"]
+    T1["topic_id=A<br/>hash→worker-1"]
+    T2["topic_id=B<br/>hash→worker-0"]
+    T3["topic_id=C<br/>hash→worker-1"]
+    T4["topic_id=D<br/>hash→worker-3"]
 
-    W0["worker-0\nkiro-cli"]
-    W1["worker-1\nkiro-cli"]
-    W3["worker-3\nkiro-cli"]
+    W0["worker-0<br/>kiro-cli"]
+    W1["worker-1<br/>kiro-cli"]
+    W3["worker-3<br/>kiro-cli"]
 
     T1 --> W1
     T2 --> W0
@@ -131,12 +131,25 @@ enum AcpCommand {
     Prompt {
         session_id: String,
         content: Vec<ContentBlock>,
-        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<String>>>,  // 返回 chunk stream
+        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<StreamEvent>>>,
     },
 }
 ```
 
-### 4.1 Prompt 流式处理时序
+### 4.1 StreamEvent
+
+流式事件分为两种类型：
+
+```rust
+pub enum StreamEvent {
+    Text(String),       // 文本增量 chunk
+    ToolCall(String),   // 工具调用中（显示标题）
+}
+```
+
+`ToolCall` 事件让用户在 IM 中看到 agent 正在执行什么工具，提升交互体验。
+
+### 4.2 Prompt 流式处理时序
 
 ```mermaid
 sequenceDiagram
@@ -151,11 +164,11 @@ sequenceDiagram
     Note over L: 立即开始消费 chunk
 
     W->>K: ACP Prompt 请求 (stdio)
-    loop AgentMessageChunk
-        K-->>W: SessionNotification::AgentMessageChunk
-        W->>W: chunk_tx.send(text)
-        W-->>L: chunk 流向 rx
-        L->>L: 追加到 full_text
+    loop AgentMessageChunk / ToolCall
+        K-->>W: SessionNotification
+        W->>W: chunk_tx.send(StreamEvent)
+        W-->>L: event 流向 rx
+        L->>L: 追加到 full_text / 显示工具状态
     end
     K-->>W: Prompt 响应（stop_reason）
     W->>W: chunk_tx = None  ← drop sender，关闭 rx
@@ -185,6 +198,8 @@ fn select_permission_option(options: &[PermissionOption]) -> Option<PermissionOp
 }
 ```
 
+列表为空时返回 `None`，触发 `internal_error`。
+
 ---
 
 ## 6. ContentBlock 构建
@@ -197,7 +212,9 @@ fn select_permission_option(options: &[PermissionOption]) -> Option<PermissionOp
 | `image_block(data, mime)`              | 图片         | base64 编码内嵌为 `ContentBlock::Image`      |
 | `resource_link_block(name, uri, mime)` | 文件         | `file:///` URI，`ContentBlock::ResourceLink` |
 
-图片使用内嵌（inline）方式，无需 agent 额外下载；文件使用 `file://` URI 让 agent 按需读取本地文件。
+- 图片使用内嵌（inline base64）方式，无需 agent 额外下载
+- 文件使用 `file://` URI 让 agent 按需读取本地文件
+- 每条消息前注入 `[im_context: message_id=..., chat_id=...]`，供 agent 提取上下文信息（如 MCP tool 调用时需要 `message_id`）
 
 ---
 
@@ -213,14 +230,14 @@ flowchart TD
     C --> D{二次尝试 send}
     D -->|Ok| Z
     D -->|Err| E[spawn_worker 重启]
-    E --> F{等待 ready 信号\n10s 超时}
+    E --> F{等待 ready 信号<br/>10s 超时}
     F -->|Ok| G[替换 sender]
     G --> H[用新 sender 发送命令]
     H --> Z
     F -->|超时/失败| X[返回错误]
 ```
 
-双重检查避免多个任务同时检测到崩溃时重复重启同一个 worker。
+双重检查避免多个任务同时检测到崩溃时重复重启同一个 worker。快速路径 clone sender 后立即释放锁，不长时间持锁。
 
 ---
 
@@ -249,8 +266,8 @@ sequenceDiagram
         KA->>W: AcpCommand::Prompt("hello")
         W->>K: ACP Prompt
         K-->>W: AgentMessageChunk (流式)
-        W-->>KA: chunks via UnboundedReceiver
-        KA->>KA: 消费所有 chunk 直到 rx 关闭
+        W-->>KA: StreamEvent via UnboundedReceiver
+        KA->>KA: 消费所有 event 直到 rx 关闭
     end
 ```
 
@@ -258,7 +275,8 @@ sequenceDiagram
 
 - **独立 worker**：keepalive 使用专用 kiro-cli 进程，不占用业务 worker 队列，不会阻塞用户请求。
 - **轻量 prompt**：仅发送 `"hello"` 文本，响应被静默消费丢弃。
-- **崩溃恢复**：心跳失败时自动重启 worker，最多连续重试 3 次（带指数退避：5s、10s、15s）。下一个 6 小时周期到来时若仍无 worker 也会再次尝试启动。初始启动失败不影响业务 worker 正常运行。
+- **崩溃恢复**：心跳失败时自动重启 worker，最多连续重试 3 次（带指数退避：5s、10s、15s）。下一个 6 小时周期到来时若仍无 worker 也会再次尝试启动。
+- **初始启动失败不阻塞**：keepalive worker 初始化失败仅记录日志，不影响业务 worker 正常运行。
 
 ---
 
@@ -286,7 +304,7 @@ sequenceDiagram
     B-->>M: Ok(AcpBridge)
 ```
 
-每个 worker 初始化完成后通过 `oneshot::Sender<Result<()>>` 发送就绪信号。`AcpBridge::start` 等待所有 worker 就绪（10 秒超时），确保在接受命令前所有 kiro-cli 进程已完成 ACP 握手。随后启动 keepalive worker 进行定期保活（见第 8 节）。
+每个 worker 初始化完成后通过 `oneshot::Sender<Result<()>>` 发送就绪信号。`AcpBridge::start` 等待所有 worker 就绪（10 秒超时），确保在接受命令前所有 kiro-cli 进程已完成 ACP 握手。初始化成功后记录 agent capabilities（image、audio、embedded_context 支持情况）。
 
 ---
 
@@ -300,3 +318,5 @@ sequenceDiagram
 | Prompt 失败（ACP 层）            | 记录 `tracing::error`，chunk_tx drop，主线程 rx 关闭，最终卡片显示已收到的部分内容 |
 | 权限请求无选项                   | 返回 `internal_error`，触发 prompt 失败流程                                        |
 | Worker 重启后仍失败              | 返回 `Err` 给调用方，`link.rs` 更新卡片为错误信息                                  |
+| Keepalive 心跳失败               | 自动重启 worker，最多 3 次退避重试；下个周期继续尝试                               |
+| kiro-cli 子进程退出              | `acp_event_loop` 结束前调用 `child.kill()` 确保子进程清理                          |

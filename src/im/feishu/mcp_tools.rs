@@ -1,4 +1,14 @@
 //! 飞书相关的 MCP Tool 定义与实现
+//!
+//! 提供两个 MCP tool 供 kiro-cli agent 反向调用：
+//!
+//! - `feishu_send_file` — 上传并发送文件到飞书会话（图片走 inline，其他走文件附件）
+//! - `feishu_get_document` — 获取飞书云文档纯文本内容（支持 URL 或裸 document_id）
+//!
+//! ## 使用方式
+//!
+//! agent 在对话中从 `[im_context]` 提取 `message_id`，
+//! 然后通过 MCP `tools/call` 调用这些工具。
 
 use serde_json::{Value, json};
 
@@ -258,9 +268,9 @@ mod tests {
     // ── list ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_list_returns_feishu_send_file_tool() {
+    fn test_list_returns_feishu_tools() {
         let tools = list();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "feishu_send_file");
         assert!(
             tools[0]["inputSchema"]["required"]
@@ -268,6 +278,13 @@ mod tests {
                 .unwrap()
                 .len()
                 >= 2
+        );
+        assert_eq!(tools[1]["name"], "feishu_get_document");
+        assert!(
+            tools[1]["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("document"))
         );
     }
 
