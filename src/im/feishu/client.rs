@@ -602,6 +602,43 @@ impl FeishuClient {
         Ok(resp.bytes().await.context("读取资源字节失败")?.to_vec())
     }
 
+    /// 获取飞书云文档的纯文本内容
+    ///
+    /// # Arguments
+    ///
+    /// * `document_id` - 文档 ID（从 URL 中提取，如 `https://xxx.feishu.cn/docx/ABC123` 中的 `ABC123`）
+    pub async fn get_document_raw_content(&self, document_id: &str) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/docx/v1/documents/{document_id}/raw_content");
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("获取云文档内容请求失败")?
+            .json()
+            .await
+            .context("解析云文档响应失败")?;
+
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("获取云文档失败: {msg}");
+        }
+
+        let content = resp
+            .pointer("/data/content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(content)
+    }
+
     /// 以消息卡片形式回复，卡片内容为 markdown
     ///
     /// # Returns

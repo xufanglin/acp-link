@@ -6,36 +6,100 @@ use super::client::FeishuClient;
 
 /// 返回飞书相关 tools 的 schema 列表
 pub fn list() -> Vec<Value> {
-    vec![json!({
-        "name": "feishu_send_file",
-        "description": "Upload and send a file to the current Feishu chat thread. For image files (.png/.jpg/.gif/.webp/.bmp), sent as inline image; otherwise as file attachment. Extract message_id from [im_context] in the conversation.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Absolute path to the file to upload"
+    vec![
+        json!({
+            "name": "feishu_send_file",
+            "description": "Upload and send a file to the current Feishu chat thread. For image files (.png/.jpg/.gif/.webp/.bmp), sent as inline image; otherwise as file attachment. Extract message_id from [im_context] in the conversation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to upload"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "The Feishu message_id to reply to (from im_context)"
+                    },
+                    "file_name": {
+                        "type": "string",
+                        "description": "Optional display name for the file. Defaults to the basename of file_path"
+                    }
                 },
-                "message_id": {
-                    "type": "string",
-                    "description": "The Feishu message_id to reply to (from im_context)"
+                "required": ["file_path", "message_id"]
+            }
+        }),
+        json!({
+            "name": "feishu_get_document",
+            "description": "Fetch the plain-text content of a Feishu cloud document (docx). Accepts either a full Feishu document URL (e.g. https://xxx.feishu.cn/docx/ABC123) or a bare document_id. The bot app must have docx:document:readonly permission.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document": {
+                        "type": "string",
+                        "description": "Feishu document URL or document_id"
+                    }
                 },
-                "file_name": {
-                    "type": "string",
-                    "description": "Optional display name for the file. Defaults to the basename of file_path"
-                }
-            },
-            "required": ["file_path", "message_id"]
-        }
-    })]
+                "required": ["document"]
+            }
+        }),
+    ]
 }
 
 /// 分发飞书 tool 调用，返回 JSON-RPC result content
 pub async fn call(tool_name: &str, args: &Value, client: &FeishuClient) -> Result<Value, String> {
     match tool_name {
         "feishu_send_file" => send_file(args, client).await,
+        "feishu_get_document" => get_document(args, client).await,
         _ => Err(format!("unknown tool: {tool_name}")),
     }
+}
+
+/// 获取飞书云文档内容
+async fn get_document(args: &Value, client: &FeishuClient) -> Result<Value, String> {
+    let raw = args.get("document").and_then(|v| v.as_str()).unwrap_or("");
+
+    if raw.is_empty() {
+        return Err("document is required".into());
+    }
+
+    let document_id = extract_document_id(raw);
+    tracing::debug!("feishu_get_document: raw={raw}, document_id={document_id}");
+
+    let content = client
+        .get_document_raw_content(&document_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("feishu_get_document 获取文档失败: {e:#}");
+            format!("{e:#}")
+        })?;
+
+    tracing::info!(
+        "feishu_get_document 成功: document_id={document_id}, len={}",
+        content.len()
+    );
+    Ok(json!({ "document_id": document_id, "content": content }))
+}
+
+/// 从飞书文档 URL 或裸 ID 中提取 document_id
+///
+/// 支持格式：
+/// - `https://xxx.feishu.cn/docx/ABC123`
+/// - `https://xxx.feishu.cn/docx/ABC123?xxx`
+/// - `https://xxx.larksuite.com/docx/ABC123`
+/// - `ABC123`（裸 ID 直接返回）
+fn extract_document_id(input: &str) -> String {
+    // 尝试匹配 /docx/{id} 路径段
+    if let Some(pos) = input.find("/docx/") {
+        let after = &input[pos + 6..]; // 跳过 "/docx/"
+        // 取到下一个 '/' 或 '?' 或字符串结尾
+        let end = after
+            .find(|c: char| c == '/' || c == '?')
+            .unwrap_or(after.len());
+        return after[..end].to_string();
+    }
+    // 裸 ID
+    input.to_string()
 }
 
 /// 上传并发送文件到飞书会话（图片走 inline，其他走文件附件）
