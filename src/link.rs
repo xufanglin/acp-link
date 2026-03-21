@@ -265,7 +265,10 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
 
     match &msg.topic_id {
         None => {
-            let hint = if is_actionable {
+            let is_link = matches!(&msg.content, ImMessageContent::Link { .. });
+            let hint = if is_link {
+                "收到链接，请回复文字指令来处理它"
+            } else if is_actionable {
                 "..."
             } else {
                 "收到，请继续输入指令"
@@ -280,7 +283,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                     {
                         tracing::error!("持久化 thread 映射失败: {e}");
                     }
-                    if is_actionable {
+                    if is_actionable && !is_link {
                         stream_acp_reply(&state, &thread_id, &msg.chat_id, &reply_msg_id, &msg)
                             .await;
                     }
@@ -318,7 +321,10 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                 }
                 None => {
                     tracing::debug!("[{}] root_id={root_id} 无映射，作为新会话处理", msg.chat_id);
-                    let hint = if is_actionable {
+                    let is_link = matches!(&msg.content, ImMessageContent::Link { .. });
+                    let hint = if is_link {
+                        "收到链接，请回复文字指令来处理它"
+                    } else if is_actionable {
                         "..."
                     } else {
                         "收到，请继续输入指令"
@@ -333,7 +339,7 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                             {
                                 tracing::error!("持久化 thread 映射失败: {e}");
                             }
-                            if is_actionable {
+                            if is_actionable && !is_link {
                                 stream_acp_reply(
                                     &state,
                                     &thread_id,
@@ -462,6 +468,7 @@ async fn prepare_prompt(
             let session_id = sid;
             let text = match &msg.content {
                 ImMessageContent::Text(t) => t.clone(),
+                ImMessageContent::Link { url } => url.clone(),
                 _ => anyhow::bail!("增量模式仅支持文本消息"),
             };
             let context = format!(
@@ -475,11 +482,12 @@ async fn prepare_prompt(
             tracing::debug!("全量聚合: thread={thread_id}");
             let submission = state.channel.aggregate_topic(thread_id, chat_id).await?;
             tracing::info!(
-                "聚合完成: topic={}, texts={}, images={}, files={}",
+                "聚合完成: topic={}, texts={}, images={}, files={}, links={}",
                 submission.topic_id,
                 submission.texts.len(),
                 submission.images.len(),
                 submission.files.len(),
+                submission.links.len(),
             );
 
             let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -517,6 +525,10 @@ async fn prepare_prompt(
                 let uri = ResourceStore::to_file_uri(&path);
                 let mime = mime_from_filename(&file.file_name);
                 blocks.push(AcpBridge::resource_link_block(&file.file_name, &uri, mime));
+            }
+
+            for link in &submission.links {
+                blocks.push(AcpBridge::text_block(link));
             }
 
             // 在最前面注入 im_context，供 agent 提取 message_id
@@ -715,7 +727,10 @@ fn format_summary(content: &ImMessageContent) -> String {
 /// 判断消息是否为文本类型
 /// 判断消息是否为可执行指令（纯文本），Link 等素材类型不算
 fn is_actionable_message(msg: &ImMessage) -> bool {
-    matches!(&msg.content, ImMessageContent::Text(_))
+    matches!(
+        &msg.content,
+        ImMessageContent::Text(_) | ImMessageContent::Link { .. }
+    )
 }
 
 /// 通过文件头魔数检测图片 MIME 类型

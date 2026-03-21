@@ -201,5 +201,6 @@ fn convert_submission(sub: ThreadSubmission) -> TopicSubmission {
                 file_name: f.file_name,
             })
             .collect(),
+        links: sub.links,
     }
 }

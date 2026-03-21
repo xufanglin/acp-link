@@ -211,6 +211,7 @@ pub struct ThreadSubmission {
     pub texts: Vec<String>,
     pub images: Vec<ImageItem>,
     pub files: Vec<FileItem>,
+    pub links: Vec<String>,
 }
 
 /// 聚合结果中的图片项
@@ -837,6 +838,7 @@ impl FeishuClient {
         let mut texts = Vec::new();
         let mut images = Vec::new();
         let mut files = Vec::new();
+        let mut links = Vec::new();
 
         for msg in &messages {
             let sender_type = msg
@@ -864,7 +866,11 @@ impl FeishuClient {
                     if let Some(text) = parse_text_content(content_str) {
                         let text = text.trim().to_string();
                         if !text.is_empty() {
-                            texts.push(text);
+                            if is_feishu_link(&text) {
+                                links.push(text);
+                            } else {
+                                texts.push(text);
+                            }
                         }
                     }
                 }
@@ -902,6 +908,7 @@ impl FeishuClient {
             texts,
             images,
             files,
+            links,
         })
     }
 

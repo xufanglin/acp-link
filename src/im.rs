@@ -87,6 +87,8 @@ pub struct TopicSubmission {
     pub images: Vec<ImageItem>,
     /// 文件列表
     pub files: Vec<FileItem>,
+    /// 链接列表（飞书云文档等 URL）
+    pub links: Vec<String>,
 }
 
 /// 聚合结果中的图片项
