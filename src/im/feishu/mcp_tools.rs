@@ -41,13 +41,13 @@ pub fn list() -> Vec<Value> {
         }),
         json!({
             "name": "feishu_get_document",
-            "description": "Fetch the plain-text content of a Feishu cloud document (docx). Accepts either a full Feishu document URL (e.g. https://xxx.feishu.cn/docx/ABC123) or a bare document_id. The bot app must have docx:document:readonly permission.",
+            "description": "Fetch the plain-text content of a Feishu cloud document. Supports docx URLs (https://xxx.feishu.cn/docx/ABC123), wiki URLs (https://xxx.feishu.cn/wiki/ABC123), and bare document_id. Wiki pages are automatically resolved to their underlying document. The bot app must have docx:document:readonly and wiki:wiki:readonly permissions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "document": {
                         "type": "string",
-                        "description": "Feishu document URL or document_id"
+                        "description": "Feishu document URL (docx or wiki) or document_id"
                     }
                 },
                 "required": ["document"]
@@ -65,7 +65,7 @@ pub async fn call(tool_name: &str, args: &Value, client: &FeishuClient) -> Resul
     }
 }
 
-/// 获取飞书云文档内容
+/// 获取飞书云文档内容（支持 docx URL、wiki URL、裸 ID）
 async fn get_document(args: &Value, client: &FeishuClient) -> Result<Value, String> {
     let raw = args.get("document").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -73,8 +73,25 @@ async fn get_document(args: &Value, client: &FeishuClient) -> Result<Value, Stri
         return Err("document is required".into());
     }
 
-    let document_id = extract_document_id(raw);
-    tracing::debug!("feishu_get_document: raw={raw}, document_id={document_id}");
+    let parsed = parse_document_ref(raw);
+    tracing::debug!("feishu_get_document: raw={raw}, parsed={parsed:?}");
+
+    let document_id = match &parsed {
+        DocumentRef::Docx(id) => id.clone(),
+        DocumentRef::Wiki(wiki_token) => {
+            // wiki 链接需要先解析出 obj_token
+            let (obj_token, obj_type) = client.get_wiki_node(wiki_token).await.map_err(|e| {
+                tracing::error!("feishu_get_document 解析 wiki 节点失败: {e:#}");
+                format!("{e:#}")
+            })?;
+            if obj_type != "docx" && obj_type != "doc" {
+                return Err(format!(
+                    "wiki 节点类型为 {obj_type}，当前仅支持 docx/doc 类型"
+                ));
+            }
+            obj_token
+        }
+    };
 
     let content = client
         .get_document_raw_content(&document_id)
@@ -91,25 +108,44 @@ async fn get_document(args: &Value, client: &FeishuClient) -> Result<Value, Stri
     Ok(json!({ "document_id": document_id, "content": content }))
 }
 
-/// 从飞书文档 URL 或裸 ID 中提取 document_id
+/// 解析后的文档引用类型
+#[derive(Debug)]
+enum DocumentRef {
+    /// docx 文档 ID（可直接调用 docx API）
+    Docx(String),
+    /// wiki token（需先通过 wiki API 解析为 obj_token）
+    Wiki(String),
+}
+
+/// 从飞书文档 URL 或裸 ID 中解析文档引用
 ///
 /// 支持格式：
-/// - `https://xxx.feishu.cn/docx/ABC123`
-/// - `https://xxx.feishu.cn/docx/ABC123?xxx`
-/// - `https://xxx.larksuite.com/docx/ABC123`
-/// - `ABC123`（裸 ID 直接返回）
-fn extract_document_id(input: &str) -> String {
-    // 尝试匹配 /docx/{id} 路径段
-    if let Some(pos) = input.find("/docx/") {
-        let after = &input[pos + 6..]; // 跳过 "/docx/"
-        // 取到下一个 '/' 或 '?' 或字符串结尾
+/// - `https://xxx.feishu.cn/docx/ABC123` → Docx("ABC123")
+/// - `https://xxx.feishu.cn/docx/ABC123?xxx` → Docx("ABC123")
+/// - `https://xxx.feishu.cn/wiki/ABC123` → Wiki("ABC123")
+/// - `https://xxx.feishu.cn/wiki/ABC123?xxx` → Wiki("ABC123")
+/// - `https://xxx.larksuite.com/docx/ABC123` → Docx("ABC123")
+/// - `https://xxx.larksuite.com/wiki/ABC123` → Wiki("ABC123")
+/// - `ABC123`（裸 ID）→ Docx("ABC123")
+fn parse_document_ref(input: &str) -> DocumentRef {
+    // 尝试匹配 /wiki/{token} 路径段
+    if let Some(pos) = input.find("/wiki/") {
+        let after = &input[pos + 6..]; // 跳过 "/wiki/"
         let end = after
             .find(|c: char| c == '/' || c == '?')
             .unwrap_or(after.len());
-        return after[..end].to_string();
+        return DocumentRef::Wiki(after[..end].to_string());
+    }
+    // 尝试匹配 /docx/{id} 路径段
+    if let Some(pos) = input.find("/docx/") {
+        let after = &input[pos + 6..]; // 跳过 "/docx/"
+        let end = after
+            .find(|c: char| c == '/' || c == '?')
+            .unwrap_or(after.len());
+        return DocumentRef::Docx(after[..end].to_string());
     }
     // 裸 ID
-    input.to_string()
+    DocumentRef::Docx(input.to_string())
 }
 
 /// 上传并发送文件到飞书会话（图片走 inline，其他走文件附件）

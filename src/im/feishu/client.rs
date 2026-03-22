@@ -646,6 +646,47 @@ impl FeishuClient {
         Ok(content)
     }
 
+    /// 通过 wiki token 获取节点信息，返回 (obj_token, obj_type)
+    pub async fn get_wiki_node(&self, wiki_token: &str) -> anyhow::Result<(String, String)> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{FEISHU_API_BASE}/wiki/v2/spaces/get_node?token={wiki_token}");
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("获取 wiki 节点请求失败")?
+            .json()
+            .await
+            .context("解析 wiki 节点响应失败")?;
+
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("获取 wiki 节点失败: {msg}");
+        }
+
+        let node = resp
+            .pointer("/data/node")
+            .context("wiki 响应缺少 node 字段")?;
+        let obj_token = node
+            .get("obj_token")
+            .and_then(|v| v.as_str())
+            .context("wiki node 缺少 obj_token")?
+            .to_string();
+        let obj_type = node
+            .get("obj_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("docx")
+            .to_string();
+
+        Ok((obj_token, obj_type))
+    }
+
     /// 以消息卡片形式回复，卡片内容为 markdown
     ///
     /// # Returns

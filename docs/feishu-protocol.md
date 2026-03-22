@@ -213,6 +213,7 @@ flowchart TD
 | 发送图片回复             | POST  | `/im/v1/messages/{message_id}/reply` (msg_type=image)                            |
 | 发送文件回复             | POST  | `/im/v1/messages/{message_id}/reply` (msg_type=file)                             |
 | 获取云文档内容           | GET   | `/docx/v1/documents/{document_id}/raw_content`                                   |
+| 获取 wiki 节点信息       | GET   | `/wiki/v2/spaces/get_node?token={token}`                                         |
 
 ### 9.1 Token 缓存策略
 
@@ -306,7 +307,11 @@ file: <binary data>
 
 ## 13. 云文档获取
 
-`feishu_get_document` MCP tool 支持从飞书云文档 URL 或裸 document_id 获取纯文本内容：
+`feishu_get_document` MCP tool 支持从飞书云文档 URL、知识库 wiki URL 或裸 document_id 获取纯文本内容。
+
+### 13.1 docx 文档
+
+直接通过 document_id 获取内容：
 
 ```
 GET /docx/v1/documents/{document_id}/raw_content
@@ -320,3 +325,22 @@ URL 解析支持以下格式：
 - `ABC123`（裸 ID 直接使用）
 
 需要应用具有 `docx:document:readonly` 权限。
+
+### 13.2 wiki 知识库文档
+
+wiki 链接需要先解析节点获取底层文档 ID，再获取内容：
+
+```
+1. GET /wiki/v2/spaces/get_node?token={wiki_token}  → 获取 obj_token, obj_type
+2. GET /docx/v1/documents/{obj_token}/raw_content    → 获取文档内容
+```
+
+URL 解析支持以下格式：
+
+- `https://xxx.feishu.cn/wiki/ABC123`
+- `https://xxx.feishu.cn/wiki/ABC123?xxx`
+- `https://xxx.larksuite.com/wiki/ABC123`
+
+其中 `xxx` 可以是任意子域名（如 `my.feishu.cn`、`yxgb3sicy7.feishu.cn` 等）。
+
+需要应用额外具有 `wiki:wiki:readonly` 权限。当前仅支持 `obj_type` 为 `docx` 或 `doc` 的 wiki 节点。

@@ -22,6 +22,7 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [K
   - `im:resource` — 获取消息中的资源文件
   - `im:chat` — 获取群信息（话题消息列表）
   - `docx:document:readonly` — 读取云文档内容（`feishu_get_document` 工具需要）
+  - `wiki:wiki:readonly` — 读取知识库 wiki 节点信息（`feishu_get_document` 处理 wiki 链接时需要）
   - 事件订阅：`im.message.receive_v1`（接收消息回调）
 
 ## 安装
@@ -207,10 +208,10 @@ args = ["acp", "--agent", "lark"]
 
 服务启动时会同时在本地启动 MCP HTTP Server（默认端口 `9800`），暴露 IM 平台相关工具供 agent 调用：
 
-| 工具名                | 说明                                                      |
-| --------------------- | --------------------------------------------------------- |
-| `feishu_send_file`    | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件） |
-| `feishu_get_document` | 获取飞书云文档纯文本内容（支持 URL 或裸 document_id）     |
+| 工具名                | 说明                                                                 |
+| --------------------- | -------------------------------------------------------------------- |
+| `feishu_send_file`    | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件）            |
+| `feishu_get_document` | 获取飞书云文档纯文本内容（支持 docx URL、wiki URL 或裸 document_id） |
 
 ## 目录结构
 
