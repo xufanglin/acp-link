@@ -15,19 +15,11 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [K
 ## 前置要求
 
 - [kiro-cli](https://kiro.dev/)（需支持 `kiro-cli acp` 模式）
-- 飞书自建应用，需开通以下权限：
-  - `im:message` — 获取与发送消息
-  - `im:message.p2p_msg` — 读取私聊消息
-  - `im:message.group_msg` — 读取群聊消息
-  - `im:resource` — 获取消息中的资源文件
-  - `im:chat` — 获取群信息（话题消息列表）
-  - `docx:document:readonly` — 读取云文档内容（`feishu_get_document` 工具需要）
-  - `wiki:wiki:readonly` — 读取知识库 wiki 节点信息（`feishu_get_document` 处理 wiki 链接时需要）
-  - 事件订阅：`im.message.receive_v1`（接收消息回调）
+- 飞书创建和配置机器人应用，并开通相应的权限。可以直接在开放平台里导入[feishu-permission.json](docs/feishu-permission.json)简化权限的配置
 
 ## 安装
 
-从 [Releases](https://github.com/xufanglin/acp-link/releases) 页面下载对应平台的二进制文件，解压后放到 PATH 可访问的目录（如 `/usr/local/bin/`）即可。
+从 [Releases](https://github.com/xufanglin/acp-link/releases) 页面下载对应平台的二进制文件，解压后放到 PATH 可访问的目录（如 `/usr/local/bin/`），增加执行权限即可。
 
 ## 配置说明
 
