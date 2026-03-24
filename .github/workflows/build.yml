@@ -7,14 +7,22 @@ on:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             artifact: acp-link-x86_64-linux-musl
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: aarch64-unknown-linux-musl
             artifact: acp-link-aarch64-linux-musl
+            os: ubuntu-latest
+            use-zigbuild: true
+          - target: aarch64-apple-darwin
+            artifact: acp-link-aarch64-apple-darwin
+            os: macos-latest
+            use-zigbuild: false
 
     steps:
       - uses: actions/checkout@v4
@@ -25,15 +33,22 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild
+        if: matrix.use-zigbuild
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
 
       - name: Install Zig
+        if: matrix.use-zigbuild
         uses: mlugg/setup-zig@v2
 
-      - name: Build
+      - name: Build (zigbuild)
+        if: matrix.use-zigbuild
         run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.use-zigbuild }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         run: |
@@ -67,3 +82,4 @@ jobs:
           files: |
             acp-link-x86_64-linux-musl
             acp-link-aarch64-linux-musl
+            acp-link-aarch64-apple-darwin
