@@ -12,7 +12,7 @@ use anyhow::Result;
 /// - 优雅关机处理（SIGTERM / Ctrl+C）
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("acp-link v0.2.5");
+    println!("acp-link v0.2.6");
 
     let config = acp_link::config::AppConfig::discover()?;
 

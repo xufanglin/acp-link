@@ -168,7 +168,18 @@ fn convert_content(content: MessageContent) -> ImMessageContent {
             file_key,
             file_type,
         },
-        MessageContent::Link { url } => ImMessageContent::Link { url },
+        MessageContent::Link { url } => {
+            // 飞书云文档链接注入 hint，引导 agent 使用 feishu_get_document 工具获取内容
+            if url.contains(".feishu.cn/wiki/") || url.contains(".feishu.cn/docx/") {
+                ImMessageContent::Link {
+                    url: format!(
+                        "{url} [hint: use feishu_get_document tool to fetch this document and wiki]\n"
+                    ),
+                }
+            } else {
+                ImMessageContent::Link { url }
+            }
+        }
         MessageContent::Unsupported {
             message_type,
             raw_content,
@@ -201,6 +212,17 @@ fn convert_submission(sub: ThreadSubmission) -> TopicSubmission {
                 file_name: f.file_name,
             })
             .collect(),
-        links: sub.links,
+        // 飞书云文档链接注入 hint，引导 agent 使用 feishu_get_document 工具获取内容
+        links: sub
+            .links
+            .into_iter()
+            .map(|link| {
+                if link.contains(".feishu.cn/wiki/") || link.contains(".feishu.cn/docx/") {
+                    format!("{link} [hint: use feishu_get_document tool to fetch this document and wiki]\n")
+                } else {
+                    link
+                }
+            })
+            .collect(),
     }
 }

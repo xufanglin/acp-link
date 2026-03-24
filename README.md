@@ -4,6 +4,33 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 AI
 
 通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给后端 agent（如 [Kiro](https://kiro.dev/) CLI、Claude 等任意 ACP 兼容 agent），agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
+## v0.2.6 配置变更
+
+本版本重构了配置文件结构，从 v0.2.5 升级需要手动修改 `config.toml`：
+
+| 变更项             | v0.2.5（旧）             | v0.2.6（新）   | 说明                                               |
+| ------------------ | ------------------------ | -------------- | -------------------------------------------------- |
+| 飞书配置 section   | `[feishu]`               | `[im.feishu]`  | 移入 `[im]` 命名空间，为多 IM 平台扩展做准备       |
+| Agent 配置 section | `[kiro]`                 | `[backend]`    | 不再绑定 kiro-cli，支持任意 ACP 兼容 agent         |
+| 平台选择字段       | `im_platform = "feishu"` | 已移除         | 改为按 `[im.*]` 子表存在性自动识别，配置哪个用哪个 |
+| MCP 注释           | `kiro-cli agent 的 ...`  | `agent 的 ...` | 措辞去 kiro 化                                     |
+
+迁移示例：
+
+```diff
+-im_platform = "feishu"
+-
+-[feishu]
++[im.feishu]
+ app_id = "cli_xxxxxxx"
+ app_secret = "xxxxxxxxx"
+
+-[kiro]
++[backend]
+ cmd = "kiro-cli"
+ args = ["acp", "--agent", "lark"]
+```
+
 ## 功能特性
 
 - 多媒体消息支持 — 文本、图片、文件、音频、视频、表情包
@@ -179,7 +206,6 @@ kiro-cli
 # 文件输出规范
 
 - 所有生成或转换的文件必须输出到 `~/.acp-link/temp/` 目录，禁止使用 `/tmp` 或其他临时目录
-- 使用 `feishu_send_file` 时，`file_path` 也应指向该目录下的文件
 ```
 
 ### 3. 确认 config.toml 中的 backend 配置
