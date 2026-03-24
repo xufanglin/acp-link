@@ -31,15 +31,40 @@ pub struct FeishuConfig {
     pub app_secret: String,
 }
 
-/// Kiro CLI 配置
+/// IM 平台配置（互斥，只能配置一个平台）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImConfig {
+    pub feishu: Option<FeishuConfig>,
+}
+
+impl ImConfig {
+    /// 返回当前配置的平台名称，未配置时返回 None
+    pub fn platform(&self) -> Option<&'static str> {
+        if self.feishu.is_some() {
+            Some("feishu")
+        } else {
+            None
+        }
+    }
+
+    /// 校验恰好配置了一个平台
+    pub fn validate(&self) -> Result<()> {
+        match self.platform() {
+            Some(_) => Ok(()),
+            None => anyhow::bail!("未配置 IM 平台，请在 [im.feishu] 中填写配置"),
+        }
+    }
+}
+
+/// ACP Backend Agent 配置（kiro-cli / claude 等任意 ACP 兼容 agent）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KiroConfig {
-    /// 可执行文件路径，例如 "kiro-cli"
+pub struct BackendConfig {
+    /// 可执行文件路径，例如 "kiro-cli" 或 "claude"
     pub cmd: String,
-    /// 启动参数，例如 ["acp"]
+    /// 启动参数，例如 ["acp", "--agent", "lark"]
     #[serde(default)]
     pub args: Vec<String>,
-    /// kiro-cli 进程池大小，通过 thread_id hash 路由实现并行处理，默认为 4
+    /// Agent 进程池大小，通过 thread_id hash 路由实现并行处理，默认为 4
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
     /// Agent 工作目录，用作项目上下文路径；未配置时默认为 `~/.acp-link/temp/`
@@ -50,15 +75,11 @@ fn default_pool_size() -> usize {
     4
 }
 
-impl KiroConfig {
+impl BackendConfig {
     /// 返回有效的工作目录：优先使用配置的 `cwd`，否则回退到 `~/.acp-link/temp/`
     pub fn effective_cwd(&self) -> PathBuf {
         self.cwd.clone().unwrap_or_else(AppConfig::temp_dir)
     }
-}
-
-fn default_im_platform() -> String {
-    "feishu".to_string()
 }
 
 fn default_log_level() -> String {
@@ -107,23 +128,22 @@ fn default_mcp_port() -> u16 {
 /// 应用全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 当前使用的 IM 平台（"feishu"）
-    #[serde(default = "default_im_platform")]
-    pub im_platform: String,
     /// 日志级别，例如 "info", "debug", "warn"
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// 日志保留天数，默认 7 天
     #[serde(default = "default_log_retention")]
     pub log_retention: u32,
-    /// Session 保留天数，默认 3 天
+    /// Session 保留天数，默认 7 天
     #[serde(default = "default_session_retention")]
     pub session_retention: u32,
-    /// 资源文件保留天数，默认 3 天
+    /// 资源文件保留天数，默认 7 天
     #[serde(default = "default_resource_retention")]
     pub resource_retention: u32,
-    pub feishu: FeishuConfig,
-    pub kiro: KiroConfig,
+    /// IM 平台配置
+    #[serde(default)]
+    pub im: ImConfig,
+    pub backend: BackendConfig,
     /// MCP Server 配置（可选，使用默认值）
     #[serde(default)]
     pub mcp: McpConfig,
@@ -140,7 +160,7 @@ impl AppConfig {
         default_home_dir().join("logs")
     }
 
-    /// 临时目录：`~/.acp-link/temp/`（用作 kiro-cli 工作目录）
+    /// 临时目录：`~/.acp-link/temp/`（用作 agent 工作目录）
     pub fn temp_dir() -> PathBuf {
         default_home_dir().join("temp")
     }
@@ -149,11 +169,11 @@ impl AppConfig {
     fn create_default(path: &Path) -> Result<()> {
         const DEFAULT_CONFIG: &str = r#"log_level = "info"
 
-[feishu]
+[im.feishu]
 app_id = "YOUR_APP_ID"
 app_secret = "YOUR_APP_SECRET"
 
-[kiro]
+[backend]
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 "#;
@@ -180,14 +200,7 @@ args = ["acp", "--agent", "lark"]
             .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
         let config: Self = toml::from_str(&content)
             .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
-        const SUPPORTED_PLATFORMS: &[&str] = &["feishu"];
-        if !SUPPORTED_PLATFORMS.contains(&config.im_platform.as_str()) {
-            anyhow::bail!(
-                "不支持的 IM 平台: \"{}\"，当前支持: {:?}",
-                config.im_platform,
-                SUPPORTED_PLATFORMS
-            );
-        }
+        config.im.validate()?;
         config.ensure_dirs()?;
         Ok(config)
     }
@@ -232,7 +245,7 @@ args = ["acp", "--agent", "lark"]
         // 未找到配置文件，创建默认配置并提醒用户修改
         Self::create_default(&global_path)?;
         anyhow::bail!(
-            "已创建默认配置文件: {}\n请修改其中的飞书 app_id/app_secret 等参数后重新启动",
+            "已创建默认配置文件: {}\n请修改其中的 IM 平台配置（如 [im.feishu]）等参数后重新启动",
             global_path.display()
         )
     }
@@ -245,11 +258,11 @@ mod tests {
     /// 构造最小合法配置 TOML 内容
     fn minimal_config_toml() -> &'static str {
         r#"
-[feishu]
+[im.feishu]
 app_id = "cli_test"
 app_secret = "secret123"
 
-[kiro]
+[backend]
 cmd = "kiro"
 args = ["acp"]
 "#
@@ -274,10 +287,11 @@ args = ["acp"]
         std::fs::write(&config_path, minimal_config_toml()).unwrap();
 
         let config = AppConfig::load(&config_path).expect("加载配置应成功");
-        assert_eq!(config.feishu.app_id, "cli_test");
-        assert_eq!(config.feishu.app_secret, "secret123");
-        assert_eq!(config.kiro.cmd, "kiro");
-        assert_eq!(config.kiro.args, vec!["acp"]);
+        let feishu = config.im.feishu.as_ref().expect("feishu 配置应存在");
+        assert_eq!(feishu.app_id, "cli_test");
+        assert_eq!(feishu.app_secret, "secret123");
+        assert_eq!(config.backend.cmd, "kiro");
+        assert_eq!(config.backend.args, vec!["acp"]);
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -314,7 +328,7 @@ args = ["acp"]
         std::fs::write(&config_path, minimal_config_toml()).unwrap();
 
         let config = AppConfig::load(&config_path).unwrap();
-        assert_eq!(config.kiro.pool_size, 4);
+        assert_eq!(config.backend.pool_size, 4);
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -323,11 +337,11 @@ args = ["acp"]
     fn test_load_custom_pool_size() {
         let tmp = make_temp_dir();
         let content = r#"
-[feishu]
+[im.feishu]
 app_id = "x"
 app_secret = "y"
 
-[kiro]
+[backend]
 cmd = "kiro"
 pool_size = 8
 "#;
@@ -335,7 +349,7 @@ pool_size = 8
         std::fs::write(&config_path, content).unwrap();
 
         let config = AppConfig::load(&config_path).unwrap();
-        assert_eq!(config.kiro.pool_size, 8);
+        assert_eq!(config.backend.pool_size, 8);
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -374,7 +388,10 @@ pool_size = 8
         }
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().feishu.app_id, "cli_test");
+        assert_eq!(
+            result.unwrap().im.feishu.as_ref().unwrap().app_id,
+            "cli_test"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

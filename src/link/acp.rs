@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::config::KiroConfig;
+use crate::config::BackendConfig;
 
 /// 流式事件：文本 chunk 或 tool call 状态
 #[derive(Debug, Clone)]
@@ -132,7 +132,7 @@ enum AcpCommand {
 /// 初始化完成后通过 `ready_tx` 发送就绪信号；初始化失败时发送错误。
 async fn acp_event_loop(
     worker_id: usize,
-    config: KiroConfig,
+    config: BackendConfig,
     mut cmd_rx: mpsc::Receiver<AcpCommand>,
     ready_tx: oneshot::Sender<Result<()>>,
 ) -> Result<()> {
@@ -271,7 +271,7 @@ async fn acp_event_loop(
 /// 通过 channel 接收来自主线程的命令并串行执行。
 fn spawn_worker(
     worker_id: usize,
-    config: &KiroConfig,
+    config: &BackendConfig,
 ) -> Result<(mpsc::Sender<AcpCommand>, oneshot::Receiver<Result<()>>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -298,7 +298,7 @@ fn spawn_worker(
 }
 
 /// 启动 keepalive worker 并等待其就绪（10 秒超时）
-async fn spawn_and_wait_keepalive(config: &KiroConfig) -> Result<mpsc::Sender<AcpCommand>> {
+async fn spawn_and_wait_keepalive(config: &BackendConfig) -> Result<mpsc::Sender<AcpCommand>> {
     let (tx, ready_rx) = spawn_worker(usize::MAX, config)?;
     match tokio::time::timeout(tokio::time::Duration::from_secs(10), ready_rx).await {
         Err(_) => anyhow::bail!("keepalive worker 初始化超时"),
@@ -351,14 +351,14 @@ pub struct AcpBridge {
     /// 每个元素对应一个 worker 线程的命令发送端（Mutex 保护以支持重启替换）
     workers: Vec<Arc<Mutex<mpsc::Sender<AcpCommand>>>>,
     /// worker 配置，用于崩溃后重启
-    config: KiroConfig,
+    config: BackendConfig,
 }
 
 impl AcpBridge {
     /// 启动 kiro-cli 进程池并建立 ACP 连接
     ///
     /// 等待所有 worker 完成初始化（最多 10 秒），确保就绪后才返回。
-    pub async fn start(config: &KiroConfig) -> Result<Self> {
+    pub async fn start(config: &BackendConfig) -> Result<Self> {
         let pool_size = config.pool_size.max(1);
         tracing::info!("启动 ACP 进程池: pool_size={pool_size}");
 
@@ -620,7 +620,7 @@ mod tests {
 
     /// 构造一个 AcpBridge，workers 使用假的 sender（接收端立即丢弃）
     fn make_bridge(pool_size: usize) -> AcpBridge {
-        let config = KiroConfig {
+        let config = BackendConfig {
             cmd: "false".to_string(),
             args: vec![],
             pool_size,

@@ -1,8 +1,8 @@
 # acp-link
 
-IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [Kiro](https://kiro.dev/) Agent 对话。
+IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 AI Agent 对话。
 
-通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给 kiro-cli agent，agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
+通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给后端 agent（如 [Kiro](https://kiro.dev/) CLI、Claude 等任意 ACP 兼容 agent），agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
 ## 功能特性
 
@@ -14,7 +14,7 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [K
 
 ## 前置要求
 
-- [kiro-cli](https://kiro.dev/)（需支持 `kiro-cli acp` 模式）
+- 支持 ACP 协议的 agent CLI（如 [kiro-cli](https://kiro.dev/)、claude 等）
 - 飞书创建和配置机器人应用，并开通相应的权限。可以直接在开放平台里导入[feishu-permission.json](docs/feishu-permission.json)简化权限的配置
 
 ## 安装
@@ -29,17 +29,15 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 [K
 
 ```toml
 log_level = "info"
-# IM 平台选择，当前支持: "feishu"，默认 "feishu"
-# im_platform = "feishu"
 # log_retention = 7       # 日志保留天数（默认 7）
 # session_retention = 7   # Session 保留天数（默认 7）
 # resource_retention = 7  # 资源文件保留天数（默认 7）
 
-[feishu]
+[im.feishu]
 app_id = "cli_xxxxxxxxxxxxxx"
 app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-[kiro]
+[backend]
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 pool_size = 4          # 进程池大小，按 topic_id hash 路由
@@ -85,7 +83,7 @@ sudo install -m 755 acp-link /usr/local/bin/
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/acp-link.service << 'EOF'
 [Unit]
-Description=ACP Link - IM to Kiro bridge
+Description=ACP Link - IM to Agent bridge
 After=network-online.target
 Wants=network-online.target
 
@@ -184,10 +182,10 @@ kiro-cli
 - 使用 `feishu_send_file` 时，`file_path` 也应指向该目录下的文件
 ```
 
-### 3. 确认 config.toml 中的 kiro 配置
+### 3. 确认 config.toml 中的 backend 配置
 
 ```toml
-[kiro]
+[backend]
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 ```

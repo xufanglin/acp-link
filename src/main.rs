@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-/// 入口：加载配置 → 初始化滚动日志 → 根据 `im_platform` 创建 IM channel → 启动 LinkService
+/// 入口：加载配置 → 初始化滚动日志 → 根据 IM 配置创建 channel → 启动 LinkService
 ///
 /// LinkService 内部会启动：
 /// - IM 消息监听循环（WS 长连接，断开自动重连）
-/// - ACP 进程池（kiro-cli 子进程，`!Send` 隔离）
+/// - ACP 进程池（agent 子进程，`!Send` 隔离）
 /// - 内嵌 MCP HTTP Server（供 agent 反向调用 IM 能力）
 /// - 定时清理任务（session / 资源 / 日志）
 /// - 优雅关机处理（SIGTERM / Ctrl+C）
@@ -33,12 +33,13 @@ async fn main() -> Result<()> {
         acp_link::config::AppConfig::data_dir().display()
     );
 
-    let channel: Arc<dyn acp_link::im::IMChannel> = match config.im_platform.as_str() {
-        "feishu" => Arc::new(acp_link::im::FeishuChannel::new(
-            &config.feishu.app_id,
-            &config.feishu.app_secret,
-        )),
-        _ => anyhow::bail!("不支持的 IM 平台: {}", config.im_platform),
+    let channel: Arc<dyn acp_link::im::IMChannel> = if let Some(ref feishu) = config.im.feishu {
+        Arc::new(acp_link::im::FeishuChannel::new(
+            &feishu.app_id,
+            &feishu.app_secret,
+        ))
+    } else {
+        anyhow::bail!("未配置 IM 平台，请在 [im.feishu] 中填写配置")
     };
 
     let service = acp_link::link::LinkService::new(&config, channel).await?;

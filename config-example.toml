@@ -8,9 +8,6 @@
 # 日志级别：trace / debug / info / warn / error
 log_level = "info"
 
-# IM 平台选择，当前支持: "feishu"
-# im_platform = "feishu"
-
 # 日志保留天数（默认 7），超过后自动清理历史日志文件
 # log_retention = 7
 
@@ -20,13 +17,14 @@ log_level = "info"
 # 资源文件保留天数（默认 7），超过后自动清理 data/ 和 temp/ 中的过期文件
 # resource_retention = 7
 
-# ── 飞书配置 ─────────────────────────────────────────────────
-[feishu]
+# ── IM 平台配置（配置哪个就用哪个，只能选一个）────────────────
+[im.feishu]
 app_id = "cli_xxxxxxx"
 app_secret = "xxxxxxxxx"
 
-# ── kiro-cli 配置 ────────────────────────────────────────────
-[kiro]
+# ── ACP Backend Agent 配置 ────────────────────────────────────
+# 支持 kiro-cli、claude 等任意 ACP 兼容 agent
+[backend]
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 
@@ -41,5 +39,5 @@ args = ["acp", "--agent", "lark"]
 # ── MCP Server 配置 ──────────────────────────────────────────
 [mcp]
 # HTTP 监听端口（默认 9800）
-# kiro-cli agent 的 mcpServers.feishu.url 需与此端口一致
+# agent 的 mcpServers.feishu.url 需与此端口一致
 # port = 9800
