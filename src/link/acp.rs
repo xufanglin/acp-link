@@ -148,6 +148,7 @@ async fn acp_event_loop(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
+        .process_group(0) // 隔离进程组，防止父进程收到 SIGHUP 时传播到子进程
         .spawn()
         .with_context(|| format!("启动 kiro-cli 失败: {}", config.cmd))?;
 
@@ -347,6 +348,7 @@ async fn keepalive_once(tx: &mpsc::Sender<AcpCommand>, cwd: &std::path::Path) ->
 /// 使用 routing key 的稳定 hash 将请求路由到固定的 worker，
 /// 保证同一 thread/session 的请求始终由同一个 kiro-cli 处理。
 /// worker 崩溃时自动重启并重试一次。
+#[derive(Clone)]
 pub struct AcpBridge {
     /// 每个元素对应一个 worker 线程的命令发送端（Mutex 保护以支持重启替换）
     workers: Vec<Arc<Mutex<mpsc::Sender<AcpCommand>>>>,

@@ -162,6 +162,14 @@ pub trait IMChannel: Send + Sync {
     /// 以文件形式回复消息
     async fn send_file_reply(&self, message_id: &str, file_key: &str) -> anyhow::Result<()>;
 
+    /// 向指定 chat_id 主动发送新消息卡片（非回复），返回 new_message_id
+    async fn send_card(
+        &self,
+        chat_id: &str,
+        chat_type: &str,
+        markdown: &str,
+    ) -> anyhow::Result<String>;
+
     /// 返回 MCP tool schema 列表
     fn mcp_tool_list(&self) -> Vec<serde_json::Value>;
 

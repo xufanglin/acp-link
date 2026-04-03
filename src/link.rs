@@ -17,6 +17,7 @@
 //! - [`resource`] — 资源文件存储（SHA256 去重、过期清理）
 
 mod acp;
+mod cron;
 mod resource;
 mod session;
 
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::ContentBlock;
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::time::{Duration, Instant};
 
 use std::collections::HashSet;
@@ -69,11 +70,15 @@ struct SharedState {
 /// 内部通过 `Arc<SharedState>` 共享状态，支持多条消息并发处理。
 pub struct LinkService {
     state: Arc<SharedState>,
+    /// 配置文件路径，用于 SIGHUP 热重载
+    config_path: PathBuf,
+    /// cron 配置变更通知通道
+    cron_tx: watch::Sender<Vec<crate::config::CronJob>>,
 }
 
 impl LinkService {
     /// 从配置初始化所有组件
-    pub async fn new(config: &AppConfig, channel: Arc<dyn IMChannel>) -> Result<Self> {
+    pub async fn new(config: &AppConfig, config_path: PathBuf, channel: Arc<dyn IMChannel>) -> Result<Self> {
         let data_dir = AppConfig::data_dir();
         let resource_store = ResourceStore::new(&data_dir);
         let sessions_path = data_dir.parent().unwrap_or(&data_dir).join("sessions.json");
@@ -90,7 +95,22 @@ impl LinkService {
             }
         });
 
+        // 启动 cron 调度器（支持热重载，始终启动）
+        let (cron_tx, cron_rx) = watch::channel(config.cron.clone());
+        {
+            let cron_bridge = bridge.clone();
+            let cron_channel = channel.clone();
+            let cron_cwd = config.backend.effective_cwd();
+            tokio::spawn(async move {
+                if let Err(e) = cron::start(cron_rx, cron_bridge, cron_channel, cron_cwd).await {
+                    tracing::error!("cron 调度器异常退出: {e}");
+                }
+            });
+        }
+
         Ok(Self {
+            config_path,
+            cron_tx,
             state: Arc::new(SharedState {
                 channel,
                 bridge,
@@ -127,6 +147,8 @@ impl LinkService {
         let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
 
+        let mut sighup = sighup_signal();
+
         loop {
             tokio::select! {
                 biased;
@@ -142,6 +164,19 @@ impl LinkService {
                     tokio::spawn(async move {
                         handle_message(state, msg).await;
                     });
+                }
+
+                _ = sighup.recv() => {
+                    tracing::info!("收到 SIGHUP，重新加载配置: {}", self.config_path.display());
+                    match AppConfig::load(&self.config_path) {
+                        Ok(new_config) => {
+                            self.cron_tx.send_replace(new_config.cron);
+                            tracing::info!("配置热重载成功");
+                        }
+                        Err(e) => {
+                            tracing::error!("配置热重载失败，保留旧配置: {e}");
+                        }
+                    }
                 }
 
                 _ = &mut shutdown => {
@@ -676,6 +711,25 @@ async fn do_stream_prepared(
         stream_start.elapsed().as_millis()
     );
     Ok(())
+}
+
+/// 返回 SIGHUP 信号接收器（Unix），非 Unix 平台返回永不触发的 channel
+#[cfg(unix)]
+fn sighup_signal() -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("注册 SIGHUP 信号处理器失败");
+    tokio::spawn(async move {
+        while sig.recv().await.is_some() {
+            let _ = tx.try_send(());
+        }
+    });
+    rx
+}
+
+#[cfg(not(unix))]
+fn sighup_signal() -> tokio::sync::mpsc::Receiver<()> {
+    tokio::sync::mpsc::channel(1).1
 }
 
 /// 等待关机信号（Ctrl+C 或 SIGTERM）

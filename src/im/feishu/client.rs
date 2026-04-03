@@ -687,6 +687,59 @@ impl FeishuClient {
         Ok((obj_token, obj_type))
     }
 
+    /// 向指定 chat_id 发送新消息卡片（不是回复），卡片内容为 markdown
+    ///
+    /// # Returns
+    ///
+    /// `new_message_id`
+    pub async fn send_card(
+        &self,
+        chat_id: &str,
+        chat_type: &str,
+        markdown: &str,
+    ) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let receive_id_type = if chat_type == "p2p" { "chat_id" } else { "chat_id" };
+        let url = format!("{FEISHU_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}");
+        let card = Self::build_card(markdown);
+        let body = serde_json::json!({
+            "receive_id": chat_id,
+            "content": card.to_string(),
+            "msg_type": "interactive",
+        });
+
+        let resp: serde_json::Value = self
+            .http
+            .clone()
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("发送卡片请求失败")?
+            .json()
+            .await
+            .context("解析发送卡片响应失败")?;
+
+        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = resp
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("发送卡片失败: code={code} msg={msg}");
+        }
+
+        let new_msg_id = resp
+            .pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        tracing::debug!("发送卡片成功: chat_id={chat_id} -> {new_msg_id}");
+        Ok(new_msg_id)
+    }
+
     /// 以消息卡片形式回复，卡片内容为 markdown
     ///
     /// # Returns

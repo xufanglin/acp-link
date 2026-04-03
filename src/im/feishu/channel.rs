@@ -101,6 +101,15 @@ impl IMChannel for FeishuChannel {
         self.client.send_file_reply(message_id, file_key).await
     }
 
+    async fn send_card(
+        &self,
+        chat_id: &str,
+        chat_type: &str,
+        markdown: &str,
+    ) -> anyhow::Result<String> {
+        self.client.send_card(chat_id, chat_type, markdown).await
+    }
+
     fn mcp_tool_list(&self) -> Vec<serde_json::Value> {
         super::mcp_tools::list()
     }

@@ -41,3 +41,20 @@ args = ["acp", "--agent", "lark"]
 # HTTP 监听端口（默认 9800）
 # agent 的 mcpServers.feishu.url 需与此端口一致
 # port = 9800
+
+# ── 定时任务配置（可以配置多个）────────────────────────────────
+# 每个 [[cron]] 块代表一条定时任务。
+# schedule 使用标准 5 位 cron 表达式：分 时 日 月 周（0/7 均表示周日）
+#   字段范围：分(0-59)  时(0-23)  日(1-31)  月(1-12)  周(0-7)
+#   常用示例：
+#     "0 9 * * 1-5"   每个工作日 09:00
+#     "30 18 * * *"   每天 18:30
+#     "0 10 1 * *"    每月 1 日 10:00
+# 任务触发时，prompt 会发给 agent，响应以消息卡片形式发到 target_id。
+#
+# 示例：工作日早 9 点发送日报提醒
+# [[cron]]
+# schedule = "0 9 * * 1-5"
+# prompt = "请生成今日工作计划摘要"
+# target_id = "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# target_type = "p2p"   # p2p（单聊）或 group（群聊），默认 p2p

@@ -4,6 +4,11 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 AI
 
 通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给后端 agent（如 [Kiro](https://kiro.dev/) CLI、Claude 等任意 ACP 兼容 agent），agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
+## v0.2.7 新功能
+
+- **定时任务**：新增 `[[cron]]` 配置块，按 cron 表达式定期触发 prompt → agent，结果推送到指定会话，支持多任务并行。
+- **Systemd 热重载**：service 文件新增 `ExecReload`，`systemctl --user reload acp-link` 可在不重启的情况下应用配置变更（如新增/修改 cron 任务）。
+
 ## v0.2.6 配置变更
 
 本版本重构了配置文件结构，从 v0.2.5 升级需要手动修改 `config.toml`：
@@ -38,6 +43,7 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 AI
 - 消息流式更新 — 实时展示 agent 响应，无需等待完整回复
 - 内嵌 MCP Server — 暴露 IM 平台工具（如文件发送）供 agent 反向调用
 - Session 持久化 — 自动过期清理，支持断点续聊
+- 定时任务 — 通过 `[[cron]]` 配置定期向 agent 发送 prompt，结果自动推送到指定会话
 
 ## 前置要求
 
@@ -117,6 +123,7 @@ Wants=network-online.target
 [Service]
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/acp-link
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
@@ -153,11 +160,14 @@ systemctl --user status acp-link.service
 journalctl --user -u acp-link.service -f
 ```
 
-停止 / 重启：
+停止 / 重启 / 热重载：
 
 ```bash
 systemctl --user stop acp-link.service
 systemctl --user restart acp-link.service
+
+# 热重载配置（修改 config.toml 后，无需完全重启）
+systemctl --user reload acp-link.service
 ```
 
 ## kiro-cli Agent 配置
@@ -228,6 +238,29 @@ args = ["acp", "--agent", "lark"]
 | --------------------- | -------------------------------------------------------------------- |
 | `feishu_send_file`    | 上传并发送文件到飞书会话（图片走 inline，其他走文件附件）            |
 | `feishu_get_document` | 获取飞书云文档纯文本内容（支持 docx URL、wiki URL 或裸 document_id） |
+
+## 定时任务
+
+通过 `[[cron]]` 块配置定时任务，服务会按 cron 表达式自动触发 prompt → agent，并将流式响应以消息卡片发送到指定 IM 会话。
+
+```toml
+# 每个工作日 09:00 发送日报提醒
+[[cron]]
+schedule    = "0 9 * * 1-5"     # 标准 5 位 cron 表达式
+prompt      = "请生成今日工作计划摘要"
+target_id   = "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+target_type = "p2p"             # p2p（单聊）或 group（群聊），默认 p2p
+
+# 可以配置多个 [[cron]] 块
+[[cron]]
+schedule    = "0 18 * * 1-5"
+prompt      = "请总结今日工作进展"
+target_id   = "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+**`target_id` 获取方式**：在飞书中打开目标会话，通过开放平台 API 或机器人收到的消息事件中获取 `chat_id`。
+
+每次 cron 触发都会创建全新 ACP session（独立上下文），不与手动对话共享 session。
 
 ## 目录结构
 

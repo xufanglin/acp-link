@@ -105,6 +105,24 @@ fn default_home_dir() -> PathBuf {
         .join(".acp-link")
 }
 
+/// 定时任务配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJob {
+    /// cron 表达式（5 位标准格式，如 "0 9 * * 1-5"）
+    pub schedule: String,
+    /// 发送给 agent 的任务 prompt
+    pub prompt: String,
+    /// 目标 IM 会话 ID（平台无关，如飞书的 chat_id）
+    pub target_id: String,
+    /// 会话类型："p2p" 或 "group"，默认 "p2p"
+    #[serde(default = "default_chat_type")]
+    pub target_type: String,
+}
+
+fn default_chat_type() -> String {
+    "p2p".to_string()
+}
+
 /// MCP Server 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -147,6 +165,9 @@ pub struct AppConfig {
     /// MCP Server 配置（可选，使用默认值）
     #[serde(default)]
     pub mcp: McpConfig,
+    /// 定时任务列表
+    #[serde(default)]
+    pub cron: Vec<CronJob>,
 }
 
 impl AppConfig {
@@ -216,6 +237,30 @@ args = ["acp", "--agent", "lark"]
         Ok(())
     }
 
+    /// 按优先级查找配置文件路径（不加载），未找到时创建默认配置文件并返回其路径
+    pub fn find_config_path() -> Result<PathBuf> {
+        if let Ok(env_path) = std::env::var("ACP_LINK_CONFIG") {
+            return Ok(PathBuf::from(env_path));
+        }
+
+        let local_path = PathBuf::from("config.toml");
+        if local_path.exists() {
+            return Ok(local_path);
+        }
+
+        let global_path = default_home_dir().join("config.toml");
+        if global_path.exists() {
+            return Ok(global_path);
+        }
+
+        // 未找到配置文件，创建默认配置并提醒用户修改
+        Self::create_default(&global_path)?;
+        anyhow::bail!(
+            "已创建默认配置文件: {}\n请修改其中的 IM 平台配置（如 [im.feishu]）等参数后重新启动",
+            global_path.display()
+        )
+    }
+
     /// 按优先级查找并加载配置文件：
     /// 1. 环境变量 `ACP_LINK_CONFIG` 指定的路径
     /// 2. 当前目录下的 `config.toml`
@@ -228,26 +273,7 @@ args = ["acp", "--agent", "lark"]
     /// let config = AppConfig::discover().unwrap();
     /// ```
     pub fn discover() -> Result<Self> {
-        if let Ok(env_path) = std::env::var("ACP_LINK_CONFIG") {
-            return Self::load(&env_path);
-        }
-
-        let local_path = PathBuf::from("config.toml");
-        if local_path.exists() {
-            return Self::load(&local_path);
-        }
-
-        let global_path = default_home_dir().join("config.toml");
-        if global_path.exists() {
-            return Self::load(&global_path);
-        }
-
-        // 未找到配置文件，创建默认配置并提醒用户修改
-        Self::create_default(&global_path)?;
-        anyhow::bail!(
-            "已创建默认配置文件: {}\n请修改其中的 IM 平台配置（如 [im.feishu]）等参数后重新启动",
-            global_path.display()
-        )
+        Self::load(Self::find_config_path()?)
     }
 }
 

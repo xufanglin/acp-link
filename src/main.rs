@@ -12,9 +12,10 @@ use anyhow::Result;
 /// - 优雅关机处理（SIGTERM / Ctrl+C）
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("acp-link v0.2.6");
+    println!("acp-link v0.2.7");
 
-    let config = acp_link::config::AppConfig::discover()?;
+    let config_path = acp_link::config::AppConfig::find_config_path()?;
+    let config = acp_link::config::AppConfig::load(&config_path)?;
 
     let log_dir = acp_link::config::AppConfig::log_dir();
     std::fs::create_dir_all(&log_dir)?;
@@ -42,6 +43,6 @@ async fn main() -> Result<()> {
         anyhow::bail!("未配置 IM 平台，请在 [im.feishu] 中填写配置")
     };
 
-    let service = acp_link::link::LinkService::new(&config, channel).await?;
+    let service = acp_link::link::LinkService::new(&config, config_path, channel).await?;
     service.run().await
 }
