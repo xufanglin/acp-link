@@ -47,6 +47,8 @@ pub enum ImMessageContent {
     Text(String),
     /// 图片
     Image { image_key: String },
+    /// 富文本（图文混排）
+    Post { text: String, image_keys: Vec<String> },
     /// 文件
     File {
         file_key: String,
