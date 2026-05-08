@@ -141,6 +141,7 @@ fn convert_content(content: MessageContent) -> ImMessageContent {
     match content {
         MessageContent::Text(s) => ImMessageContent::Text(s),
         MessageContent::Image { image_key } => ImMessageContent::Image { image_key },
+        MessageContent::Post { text, image_keys } => ImMessageContent::Post { text, image_keys },
         MessageContent::File {
             file_key,
             file_name,

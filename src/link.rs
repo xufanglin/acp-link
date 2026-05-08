@@ -501,16 +501,74 @@ async fn prepare_prompt(
                 state.loaded_sessions.write().await.insert(sid.clone());
             }
             let session_id = sid;
-            let text = match &msg.content {
-                ImMessageContent::Text(t) => t.clone(),
-                ImMessageContent::Link { url } => url.clone(),
-                _ => anyhow::bail!("增量模式仅支持文本消息"),
+            let mut blocks: Vec<ContentBlock> = Vec::new();
+            blocks.push(AcpBridge::text_block(&format!(
+                "[im_context: message_id={}, chat_id={}]",
+                msg.message_id, msg.chat_id
+            )));
+            match &msg.content {
+                ImMessageContent::Text(t) => {
+                    blocks.push(AcpBridge::text_block(t));
+                }
+                ImMessageContent::Link { url } => {
+                    blocks.push(AcpBridge::text_block(url));
+                }
+                ImMessageContent::Image { image_key } => {
+                    let data = state
+                        .channel
+                        .download_resource(&msg.message_id, image_key, "image")
+                        .await?;
+                    let mime = detect_image_mime(&data);
+                    tracing::debug!(
+                        "增量图片已下载: {} ({} bytes, {})",
+                        image_key,
+                        data.len(),
+                        mime
+                    );
+                    blocks.push(AcpBridge::image_block(&data, mime));
+                }
+                ImMessageContent::Post { text, image_keys } => {
+                    if !text.is_empty() {
+                        blocks.push(AcpBridge::text_block(text));
+                    }
+                    for image_key in image_keys {
+                        let data = state
+                            .channel
+                            .download_resource(&msg.message_id, image_key, "image")
+                            .await?;
+                        let mime = detect_image_mime(&data);
+                        tracing::debug!(
+                            "增量 post 图片已下载: {} ({} bytes, {})",
+                            image_key,
+                            data.len(),
+                            mime
+                        );
+                        blocks.push(AcpBridge::image_block(&data, mime));
+                    }
+                }
+                ImMessageContent::File { file_key, file_name, .. } => {
+                    let path = state
+                        .resource_store
+                        .save_resource(
+                            state.channel.as_ref(),
+                            &msg.message_id,
+                            file_key,
+                            "file",
+                            file_name,
+                        )
+                        .await?;
+                    let uri = ResourceStore::to_file_uri(&path);
+                    let mime = mime_from_filename(file_name);
+                    tracing::debug!(
+                        "增量文件已下载: {} -> {}",
+                        file_name,
+                        path.display()
+                    );
+                    blocks.push(AcpBridge::resource_link_block(file_name, &uri, mime));
+                }
+                _ => anyhow::bail!("增量模式暂不支持此消息类型"),
             };
-            let context = format!(
-                "[im_context: message_id={}, chat_id={}]\n\n{}",
-                msg.message_id, msg.chat_id, text
-            );
-            Ok((session_id, vec![AcpBridge::text_block(&context)]))
+            Ok((session_id, blocks))
         }
         None => {
             // 新 session：全量聚合 thread 内容
@@ -759,6 +817,7 @@ fn format_summary(content: &ImMessageContent) -> String {
     match content {
         ImMessageContent::Text(t) => format!("文本: {t}"),
         ImMessageContent::Image { image_key } => format!("图片: {image_key}"),
+        ImMessageContent::Post { text, image_keys } => format!("富文本: {} (图片{}张)", text.chars().take(30).collect::<String>(), image_keys.len()),
         ImMessageContent::File {
             file_name,
             file_size,
@@ -783,7 +842,7 @@ fn format_summary(content: &ImMessageContent) -> String {
 fn is_actionable_message(msg: &ImMessage) -> bool {
     matches!(
         &msg.content,
-        ImMessageContent::Text(_) | ImMessageContent::Link { .. }
+        ImMessageContent::Text(_) | ImMessageContent::Link { .. } | ImMessageContent::Image { .. } | ImMessageContent::Post { .. } | ImMessageContent::File { .. }
     )
 }
 

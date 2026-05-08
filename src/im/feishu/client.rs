@@ -157,6 +157,8 @@ pub enum MessageContent {
     Text(String),
     /// 图片
     Image { image_key: String },
+    /// 富文本（图文混排）
+    Post { text: String, image_keys: Vec<String> },
     /// 文件（PDF、Word、Excel 等）
     File {
         file_key: String,
@@ -491,10 +493,22 @@ impl FeishuClient {
                             None => continue,
                         },
                         "post" => {
-                            tracing::debug!("飞书 WS: 不支持的消息类型 'post'");
-                            MessageContent::Unsupported {
-                                message_type: "post".to_string(),
-                                raw_content: raw_msg.content.clone(),
+                            // 富文本消息：提取文本和图片
+                            match parse_post_content(&raw_msg.content) {
+                                Some((text, image_keys)) if !text.is_empty() || !image_keys.is_empty() => {
+                                    if image_keys.is_empty() {
+                                        MessageContent::Text(text)
+                                    } else {
+                                        MessageContent::Post { text, image_keys }
+                                    }
+                                }
+                                _ => {
+                                    tracing::debug!("飞书 WS: post 消息无文本内容");
+                                    MessageContent::Unsupported {
+                                        message_type: "post".to_string(),
+                                        raw_content: raw_msg.content.clone(),
+                                    }
+                                }
                             }
                         }
                         "image"   => parse_image_content(&raw_msg.content),
@@ -992,6 +1006,46 @@ impl FeishuClient {
                         });
                     }
                 }
+                "post" => {
+                    // 富文本消息：提取文本和图片
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content_str) {
+                        // post 结构: {"content": [[{"tag":"text","text":"..."}, {"tag":"img","image_key":"..."}]]}
+                        if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+                            let mut post_texts: Vec<String> = Vec::new();
+                            for line in content {
+                                if let Some(elements) = line.as_array() {
+                                    for elem in elements {
+                                        let tag = elem.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                                        match tag {
+                                            "text" => {
+                                                if let Some(t) = elem.get("text").and_then(|t| t.as_str()) {
+                                                    let t = t.trim().to_string();
+                                                    if !t.is_empty() {
+                                                        post_texts.push(t);
+                                                    }
+                                                }
+                                            }
+                                            "img" => {
+                                                if let Some(key) = elem.get("image_key").and_then(|k| k.as_str()) {
+                                                    if !key.is_empty() {
+                                                        images.push(ImageItem {
+                                                            message_id: message_id.clone(),
+                                                            image_key: key.to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            if !post_texts.is_empty() {
+                                texts.push(post_texts.join("\n"));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1307,7 +1361,46 @@ fn parse_sticker_content(content: &str) -> MessageContent {
     }
 }
 
-/// 解析 text 消息内容：`{"text": "..."}`
+/// 解析 post（富文本）消息，提取文本和图片 keys
+fn parse_post_content(content: &str) -> Option<(String, Vec<String>)> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    // post 结构: {"content": [[{"tag":"text","text":"..."}, {"tag":"img","image_key":"..."}]]}
+    let content_arr = v.get("content").and_then(|c| c.as_array())?;
+    let mut texts: Vec<String> = Vec::new();
+    let mut image_keys: Vec<String> = Vec::new();
+    for line in content_arr {
+        if let Some(elements) = line.as_array() {
+            for elem in elements {
+                let tag = elem.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                match tag {
+                    "text" => {
+                        if let Some(t) = elem.get("text").and_then(|t| t.as_str()) {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                texts.push(t.to_string());
+                            }
+                        }
+                    }
+                    "img" => {
+                        if let Some(key) = elem.get("image_key").and_then(|k| k.as_str()) {
+                            if !key.is_empty() {
+                                image_keys.push(key.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let text = texts.join("\n");
+    if text.is_empty() && image_keys.is_empty() {
+        None
+    } else {
+        Some((text, image_keys))
+    }
+}
+
 fn parse_text_content(content: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
     v.get("text")
