@@ -12,7 +12,26 @@ use anyhow::Result;
 /// - 优雅关机处理（SIGTERM / Ctrl+C）
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("acp-link v0.2.7");
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("acp-link v{}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                println!(
+                    "acp-link v{}\n\nUsage: acp-link [OPTIONS]\n\nOptions:\n  -V, --version  Print version and exit\n  -h, --help     Print help and exit",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("未知参数: {other}（可用：--version、--help）");
+            }
+        }
+    }
+
+    println!("acp-link v{}", env!("CARGO_PKG_VERSION"));
 
     let config_path = acp_link::config::AppConfig::find_config_path()?;
     let config = acp_link::config::AppConfig::load(&config_path)?;

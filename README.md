@@ -4,6 +4,10 @@ IM ↔ ACP (Agent Client Protocol) 桥接服务，让你在飞书中直接与 AI
 
 通过飞书 WebSocket 长连接监听消息，经 ACP 协议转发给后端 agent（如 [Kiro](https://kiro.dev/) CLI、Claude 等任意 ACP 兼容 agent），agent 的流式响应会以富文本消息实时回复到飞书。架构设计支持扩展到钉钉、Slack 等其他 IM 平台。
 
+## v0.2.8 修复
+
+- **修复增量模式丢失附件**：已有 session 的话题里先发图片/文件、再发文字指令时，附件不再被忽略；现在会随文字指令一起发给 agent。
+
 ## v0.2.7 新功能
 
 - **定时任务**：新增 `[[cron]]` 配置块，按 cron 表达式定期触发 prompt → agent，结果推送到指定会话，支持多任务并行。

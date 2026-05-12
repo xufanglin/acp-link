@@ -29,17 +29,24 @@ use anyhow::Result;
 use tokio::sync::{watch, RwLock};
 use tokio::time::{Duration, Instant};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use self::acp::{AcpBridge, StreamEvent};
 use self::resource::ResourceStore;
 use self::session::SessionMap;
 
 use crate::config::AppConfig;
-use crate::im::{IMChannel, ImMessage, ImMessageContent};
+use crate::im::{FileItem, IMChannel, ImMessage, ImMessageContent, ImageItem};
 
 /// 消息流式更新的节流间隔
 const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 已进入 session 但尚未随文字指令一起发出的附件
+#[derive(Clone)]
+enum PendingAttachment {
+    Image(ImageItem),
+    File(FileItem),
+}
 
 /// Link 服务的共享状态，多个消息处理任务并发访问
 struct SharedState {
@@ -53,6 +60,8 @@ struct SharedState {
     session_map: RwLock<SessionMap>,
     /// 已在 ACP worker 中加载的 session_id 集合（跳过重复 load_session）
     loaded_sessions: RwLock<HashSet<String>>,
+    /// 增量模式下每个 thread 尚未投递给 agent 的附件
+    pending_attachments: RwLock<HashMap<String, Vec<PendingAttachment>>>,
     /// 工作目录，传递给 ACP session
     cwd: PathBuf,
     /// Session 保留天数
@@ -117,6 +126,7 @@ impl LinkService {
                 resource_store,
                 session_map: RwLock::new(session_map),
                 loaded_sessions: RwLock::new(HashSet::new()),
+                pending_attachments: RwLock::new(HashMap::new()),
                 cwd,
                 session_retention: config.session_retention,
                 resource_retention: config.resource_retention,
@@ -345,6 +355,26 @@ async fn handle_message(state: Arc<SharedState>, msg: ImMessage) {
                         )
                         .await;
                     } else {
+                        // 仅当 session 已建立（即后续会走增量路径）时才入队。
+                        // 若 session 未建立，后续首条文字指令会触发 aggregate_topic
+                        // 从飞书 REST 拉全量历史，已包含该附件，无需再入队，否则会导致重复发送。
+                        let has_session = state
+                            .session_map
+                            .read()
+                            .await
+                            .get_session_id(&thread_id)
+                            .is_some();
+                        if has_session {
+                            if let Some(att) = pending_attachment_from(&msg) {
+                                state
+                                    .pending_attachments
+                                    .write()
+                                    .await
+                                    .entry(thread_id.clone())
+                                    .or_default()
+                                    .push(att);
+                            }
+                        }
                         if let Err(e) = state
                             .channel
                             .reply_message(&msg.message_id, "收到附件，请回复文字指令来处理它")
@@ -488,7 +518,7 @@ async fn prepare_prompt(
 
     match existing_sid {
         Some(sid) => {
-            // 已有 session：增量，只发当前消息文本
+            // 已有 session：增量，只发当前消息文本 + 此前堆积的附件
             tracing::debug!("增量 prompt: thread={thread_id} -> session={sid}");
             let already_loaded = state.loaded_sessions.read().await.contains(&sid);
             if already_loaded {
@@ -510,7 +540,22 @@ async fn prepare_prompt(
                 "[im_context: message_id={}, chat_id={}]\n\n{}",
                 msg.message_id, msg.chat_id, text
             );
-            Ok((session_id, vec![AcpBridge::text_block(&context)]))
+            let pending = state
+                .pending_attachments
+                .write()
+                .await
+                .remove(thread_id)
+                .unwrap_or_default();
+            if !pending.is_empty() {
+                tracing::info!(
+                    "增量模式附带 {} 个待处理附件: thread={thread_id}",
+                    pending.len()
+                );
+            }
+            let mut blocks: Vec<ContentBlock> = Vec::with_capacity(pending.len() + 1);
+            blocks.push(AcpBridge::text_block(&context));
+            append_attachment_blocks(state, &pending, &mut blocks).await?;
+            Ok((session_id, blocks))
         }
         None => {
             // 新 session：全量聚合 thread 内容
@@ -785,6 +830,68 @@ fn is_actionable_message(msg: &ImMessage) -> bool {
         &msg.content,
         ImMessageContent::Text(_) | ImMessageContent::Link { .. }
     )
+}
+
+/// 将非 actionable 消息抽取为 pending 附件；不支持的类型返回 None
+fn pending_attachment_from(msg: &ImMessage) -> Option<PendingAttachment> {
+    match &msg.content {
+        ImMessageContent::Image { image_key } => Some(PendingAttachment::Image(ImageItem {
+            message_id: msg.message_id.clone(),
+            image_key: image_key.clone(),
+        })),
+        ImMessageContent::File {
+            file_key,
+            file_name,
+            ..
+        } => Some(PendingAttachment::File(FileItem {
+            message_id: msg.message_id.clone(),
+            file_key: file_key.clone(),
+            file_name: file_name.clone(),
+        })),
+        _ => None,
+    }
+}
+
+/// 下载 pending 附件并追加为 ContentBlock
+async fn append_attachment_blocks(
+    state: &Arc<SharedState>,
+    pending: &[PendingAttachment],
+    blocks: &mut Vec<ContentBlock>,
+) -> Result<()> {
+    for att in pending {
+        match att {
+            PendingAttachment::Image(img) => {
+                let data = state
+                    .channel
+                    .download_resource(&img.message_id, &img.image_key, "image")
+                    .await?;
+                let mime = detect_image_mime(&data);
+                tracing::debug!(
+                    "pending 图片已下载: {} ({} bytes, {})",
+                    img.image_key,
+                    data.len(),
+                    mime
+                );
+                blocks.push(AcpBridge::image_block(&data, mime));
+            }
+            PendingAttachment::File(file) => {
+                let path = state
+                    .resource_store
+                    .save_resource(
+                        state.channel.as_ref(),
+                        &file.message_id,
+                        &file.file_key,
+                        "file",
+                        &file.file_name,
+                    )
+                    .await?;
+                let uri = ResourceStore::to_file_uri(&path);
+                let mime = mime_from_filename(&file.file_name);
+                blocks.push(AcpBridge::resource_link_block(&file.file_name, &uri, mime));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 通过文件头魔数检测图片 MIME 类型
