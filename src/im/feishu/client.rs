@@ -136,9 +136,15 @@ struct RawMention {
 
 #[derive(Debug, Deserialize, Default)]
 struct RawMentionId {
-    /// bot mention 没有 user_id，普通用户有
+    /// 被 @ 对象的 user_id。注意：仅当应用申请了通讯录(user_id)权限时才会返回，
+    /// 否则普通用户和机器人都为空，因此不能用它来判定是否 @ 了机器人。
+    /// 保留字段仅作文档说明，逻辑判定一律改用 open_id。
     #[serde(default)]
+    #[allow(dead_code)]
     user_id: Option<String>,
+    /// 被 @ 对象的 open_id，始终返回，用于与机器人自身 open_id 比对。
+    #[serde(default)]
+    open_id: Option<String>,
 }
 
 /// tenant_access_token 缓存，到期前自动刷新
@@ -269,6 +275,8 @@ pub struct FeishuClient {
     tenant_token: Arc<RwLock<Option<CachedToken>>>,
     /// 消息 ID 去重窗口（防止 WS 重连后重复处理）
     seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// 缓存的机器人自身 open_id（用于群聊「是否 @ 了机器人」判定）
+    bot_open_id: Arc<RwLock<Option<String>>>,
 }
 
 impl FeishuClient {
@@ -280,6 +288,7 @@ impl FeishuClient {
             http: reqwest::Client::new(),
             tenant_token: Arc::new(RwLock::new(None)),
             seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            bot_open_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -288,6 +297,13 @@ impl FeishuClient {
     /// 连接断开（正常关闭、超时、读写错误）时返回 `Ok(())`，
     /// 由调用方决定是否重连。仅在内部逻辑错误时返回 `Err`。
     pub async fn listen(&self, tx: tokio::sync::mpsc::Sender<FeishuMessage>) -> anyhow::Result<()> {
+        // 先确定机器人自身 open_id，用于群聊「是否 @ 了机器人」判定。
+        // 失败则返回 Err，由外层 5s 后重连重试；成功后会被缓存，后续重连不再请求。
+        let bot_open_id = self
+            .get_bot_open_id()
+            .await
+            .context("获取机器人 open_id 失败")?;
+
         let (wss_url, client_config) = self.get_ws_endpoint().await?;
         let service_id = parse_service_id(&wss_url);
         tracing::info!("飞书 WS: 连接 {wss_url}");
@@ -465,9 +481,11 @@ impl FeishuClient {
                         seen.insert(raw_msg.message_id.clone(), now);
                     }
 
-                    // 群聊须 @机器人（bot mention 无 user_id）
+                    // 群聊须 @机器人：用 mention 的 open_id 与机器人自身 open_id 比对。
+                    // 不能用「mention 无 user_id」判定——应用未申请通讯录(user_id)权限时，
+                    // 普通用户的 mention 同样没有 user_id，会被误判为 @机器人。
                     if raw_msg.chat_type == "group"
-                        && !raw_msg.mentions.iter().any(|m| m.id.user_id.is_none())
+                        && !mentions_bot(&raw_msg.mentions, &bot_open_id)
                     {
                         tracing::debug!(
                             "飞书 WS: 群聊消息未@机器人，跳过 {}",
@@ -1223,6 +1241,64 @@ impl FeishuClient {
 
         Ok(token)
     }
+
+    /// 获取（带缓存的）机器人自身 open_id。
+    ///
+    /// 通过 `/bot/v3/info` 查询，结果缓存，后续直接复用。
+    /// 用于群聊中判定某条消息是否真的 @ 了本机器人。
+    pub async fn get_bot_open_id(&self) -> anyhow::Result<String> {
+        {
+            let cached = self.bot_open_id.read().await;
+            if let Some(ref id) = *cached {
+                return Ok(id.clone());
+            }
+        }
+
+        let token = self.get_tenant_access_token().await?;
+        let data: serde_json::Value = self
+            .http
+            .clone()
+            .get(format!("{FEISHU_API_BASE}/bot/v3/info"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("获取机器人信息请求失败")?
+            .json()
+            .await
+            .context("解析机器人信息响应失败")?;
+
+        let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = data
+                .get("msg")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("获取机器人信息失败: code={code} msg={msg}");
+        }
+
+        let open_id = data
+            .pointer("/bot/open_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("机器人信息响应缺少 bot.open_id 字段"))?
+            .to_string();
+
+        tracing::info!("机器人 open_id 已获取: {open_id}");
+        *self.bot_open_id.write().await = Some(open_id.clone());
+        Ok(open_id)
+    }
+}
+
+/// 判断一条群聊消息是否 @ 了机器人本身。
+///
+/// 通过比对每个 mention 的 `open_id` 与机器人自身 `open_id` 来判定。
+/// **不能**用「mention 缺少 user_id」来判定：应用未申请通讯录(user_id)权限时，
+/// 普通用户被 @ 的 mention 同样没有 user_id，会被误判成 @机器人，
+/// 导致 @ 任意同事都触发机器人建话题。
+fn mentions_bot(mentions: &[RawMention], bot_open_id: &str) -> bool {
+    !bot_open_id.is_empty()
+        && mentions
+            .iter()
+            .any(|m| m.id.open_id.as_deref() == Some(bot_open_id))
 }
 
 /// 构建 ping 控制帧
@@ -1808,7 +1884,7 @@ mod tests {
 
     #[test]
     fn test_msg_receive_payload_group_with_mention() {
-        // 群聊消息带 @mention，mentions[0].id.user_id 为 None 表示 @bot
+        // 群聊消息带 @mention，mention 的 open_id 用于判定是否 @ 了机器人
         let json = r#"{
             "sender": {
                 "sender_id": {"open_id": "ou_user1"},
@@ -1820,13 +1896,56 @@ mod tests {
                 "chat_type": "group",
                 "message_type": "text",
                 "content": "{\"text\": \"@bot hello\"}",
-                "mentions": [{"id": {}}]
+                "mentions": [{"id": {"open_id": "ou_bot"}}]
             }
         }"#;
         let payload: MsgReceivePayload = serde_json::from_str(json).expect("应成功反序列化");
         assert_eq!(payload.message.chat_type, "group");
-        // bot mention 的 user_id 应为 None
-        assert!(payload.message.mentions[0].id.user_id.is_none());
+        assert_eq!(
+            payload.message.mentions[0].id.open_id.as_deref(),
+            Some("ou_bot")
+        );
+    }
+
+    // ── 群聊 @机器人 判定（基于 open_id 比对）─────────────────────────────────
+
+    fn mention_with_open_id(open_id: Option<&str>) -> RawMention {
+        RawMention {
+            id: RawMentionId {
+                user_id: None,
+                open_id: open_id.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test]
+    fn test_mentions_bot_true_when_bot_open_id_present() {
+        // mention 命中机器人 open_id → 判定为 @机器人
+        let mentions = vec![
+            mention_with_open_id(Some("ou_human")),
+            mention_with_open_id(Some("ou_bot")),
+        ];
+        assert!(mentions_bot(&mentions, "ou_bot"));
+    }
+
+    #[test]
+    fn test_mentions_bot_false_when_only_human_mentioned() {
+        // 只 @ 了真人（即便其 user_id 缺失），不应判定为 @机器人。
+        // 这是修复的核心场景：@别人 不再误触发机器人建话题。
+        let mentions = vec![mention_with_open_id(Some("ou_human"))];
+        assert!(!mentions_bot(&mentions, "ou_bot"));
+    }
+
+    #[test]
+    fn test_mentions_bot_false_when_no_mentions() {
+        assert!(!mentions_bot(&[], "ou_bot"));
+    }
+
+    #[test]
+    fn test_mentions_bot_false_when_bot_open_id_unknown() {
+        // 未取到机器人 open_id 时（空串），保守判定为「未@机器人」，避免误触发
+        let mentions = vec![mention_with_open_id(Some("ou_bot"))];
+        assert!(!mentions_bot(&mentions, ""));
     }
 
     // ── 分片重组纯逻辑 ───────────────────────────────────────────────────────
